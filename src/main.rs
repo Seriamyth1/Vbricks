@@ -364,27 +364,23 @@ unsafe fn for_rows_avx2b<const N: usize>(data: &[u8], s: usize, e: usize, f: &mu
             f(s + line_start, buf.get_unchecked(line_start..line_end), &fl);
             return;
         }
+        // quoted line: a field may be wrapped in quotes as a whole; any other quote makes the line malformed.
+        // Branch-free per field; the total quote count catches quotes inside fields.
         let mut expect = 0u32;
+        let mut bad = false;
         let mut st = line_start;
         for i in 0..N {
             let en = if i + 1 < N { *ends.get_unchecked(i) } else { line_end };
             let len = en - st;
-            let (a, b) = if len > 0 && *buf.get_unchecked(st) == b'"' {
-                if len < 2 || *buf.get_unchecked(en - 1) != b'"' {
-                    return;
-                }
-                expect += 2;
-                (st + 1, en - 1)
-            } else {
-                if len > 0 && *buf.get_unchecked(en - 1) == b'"' {
-                    return;
-                }
-                (st, en)
-            };
-            *fl.get_unchecked_mut(i) = ((a - line_start) as u32, (b - line_start) as u32);
+            let first = len > 0 && *buf.get_unchecked(st) == b'"';
+            let last = len > 0 && *buf.get_unchecked(en - 1) == b'"';
+            bad |= (first != last) | (first & (len < 2));
+            let q = first as usize;
+            expect += 2 * q as u32;
+            *fl.get_unchecked_mut(i) = ((st + q - line_start) as u32, (en - q - line_start) as u32);
             st = en + 1;
         }
-        if qcount != expect {
+        if bad || qcount != expect {
             return;
         }
         f(s + line_start, buf.get_unchecked(line_start..line_end), &fl);
@@ -601,6 +597,137 @@ fn parse_dt19(b: &[u8]) -> Option<i64> {
     Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1000)
 }
 
+/// Year-month prefixes ("YYYY-MM-") of the few months around the window, so the common timestamp
+/// is checked with one 8-byte compare instead of decoding and validating year and month.
+struct MonthPre {
+    pre: [u64; 8],
+    base: [i64; 8], // epoch day of the month's day 0
+    dim: [u8; 8],
+    n: usize,
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+impl MonthPre {
+    fn new(ws: i64, we: i64) -> Self {
+        let mut mp = MonthPre { pre: [u64::MAX; 8], base: [0; 8], dim: [0; 8], n: 0 };
+        let mut day = ws.div_euclid(DAY_MS) - 40;
+        let last = we.div_euclid(DAY_MS) + 40;
+        while day <= last && mp.n < 8 {
+            let (y, m, _) = civil_from_days(day);
+            if (0..=9999).contains(&y) && (mp.n == 0 || mp.base[mp.n - 1] != days_from_civil(y, m, 1) - 1) {
+                let txt = format!("{:04}-{:02}-", y, m);
+                let dim = match m {
+                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                    4 | 6 | 9 | 11 => 30,
+                    _ => if is_leap(y) { 29 } else { 28 },
+                };
+                mp.pre[mp.n] = u64::from_le_bytes(txt.as_bytes().try_into().unwrap());
+                mp.base[mp.n] = days_from_civil(y, m, 1) - 1;
+                mp.dim[mp.n] = dim;
+                mp.n += 1;
+            }
+            day += 1;
+        }
+        mp
+    }
+
+    /// Same result as parse_dt19 on b[..19] (b.len() >= 19).
+    #[inline(always)]
+    fn dt19(&self, b: &[u8]) -> Option<i64> {
+        let w0 = ld8(b, 0);
+        let mut i = 0;
+        while i < self.n {
+            if w0 == self.pre[i] {
+                let w1 = ld8(b, 8); // D D T H H : M M
+                let w2 = ld8(b, 11); // H H : M M : S S
+                const S1: u64 = 0x0000_ff00_00ff_0000;
+                const E1: u64 = 0x0000_3a00_0054_0000;
+                const S2: u64 = 0x0000_ff00_0000_0000;
+                const E2: u64 = 0x0000_3a00_0000_0000;
+                if (w1 & S1) != E1 || (w2 & S2) != E2 {
+                    return None;
+                }
+                let x1 = swar_digits(w1, 0xffff_00ff_ff00_ffff)?;
+                let x2 = swar_digits(w2, 0xffff_0000_0000_0000)?;
+                let p1 = x1.wrapping_mul(10).wrapping_add(x1 >> 8);
+                let p2 = x2.wrapping_mul(10).wrapping_add(x2 >> 8);
+                let d = (p1 & 0xff) as i64;
+                let h = ((p1 >> 24) & 0xff) as i64;
+                let mi = ((p1 >> 48) & 0xff) as i64;
+                let s = ((p2 >> 48) & 0xff) as i64;
+                if d < 1 || d > self.dim[i] as i64 || h > 23 || mi > 59 || s > 59 {
+                    return None;
+                }
+                return Some((self.base[i] + d) * DAY_MS + h * 3_600_000 + mi * 60_000 + s * 1000);
+            }
+            i += 1;
+        }
+        parse_dt19(b)
+    }
+
+    /// ingest_ts: always valid F1 per the rules, so a known month needs no checks.
+    #[inline(always)]
+    fn ingest(&self, b: &[u8]) -> Option<i64> {
+        if b.len() == 20 {
+            let w0 = ld8(b, 0);
+            let mut i = 0;
+            while i < self.n {
+                if w0 == self.pre[i] {
+                    let x1 = (ld8(b, 8) ^ 0x3030_3030_3030_3030) & 0xffff_00ff_ff00_ffff;
+                    let x2 = (ld8(b, 11) ^ 0x3030_3030_3030_3030) & 0xffff_0000_0000_0000;
+                    if (x1 | x2) & 0xf0f0_f0f0_f0f0_f0f0 != 0 || b[19] != b'Z' {
+                        break; // not plain digits: take the checked path
+                    }
+                    let p1 = x1.wrapping_mul(10).wrapping_add(x1 >> 8);
+                    let p2 = x2.wrapping_mul(10).wrapping_add(x2 >> 8);
+                    let d = (p1 & 0xff) as i64;
+                    let h = ((p1 >> 24) & 0xff) as i64;
+                    let mi = ((p1 >> 48) & 0xff) as i64;
+                    let s = ((p2 >> 48) & 0xff) as i64;
+                    return Some((self.base[i] + d) * DAY_MS + h * 3_600_000 + mi * 60_000 + s * 1000);
+                }
+                i += 1;
+            }
+        }
+        self.ts(b)
+    }
+
+    /// parse_ts with the fast date path.
+    #[inline(always)]
+    fn ts(&self, b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        if n == 20 {
+            if b[19] == b'Z' {
+                return self.dt19(b);
+            }
+        } else if n == 25 {
+            if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+                let base = self.dt19(b)?;
+                let oh = dig2(b, 20)?;
+                let om = dig2(b, 23)?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                let off = (oh * 60 + om) * 60_000;
+                return Some(if b[19] == b'+' { base - off } else { base + off });
+            }
+        }
+        parse_ts(b)
+    }
+}
+
 /// ingest_ts is always valid F1 per the rules: convert without re-validating every field.
 /// Falls back to the full parser if the shape is not the expected 20-byte F1.
 #[inline]
@@ -737,6 +864,23 @@ fn fh(b: &[u8], seed: u64) -> u64 {
         (0, 0)
     };
     mum(a ^ P0 ^ seed, c ^ P1 ^ (n as u64).wrapping_mul(P2))
+}
+
+/// 64-bit hash plus 32 more bits from the same 128-bit product (96-bit identity for event ids).
+#[inline(always)]
+fn fh96(b: &[u8]) -> (u64, u32) {
+    const P0: u64 = 0xa076_1d64_78bd_642f;
+    const P1: u64 = 0xe703_7ed1_a0b4_28db;
+    const P2: u64 = 0x8ebc_6af0_9c88_c6e3;
+    const SEED: u64 = 0x2d35_8dcc_aa6c_78a5;
+    let n = b.len();
+    if (8..=16).contains(&n) {
+        let r = ((ld8(b, 0) ^ P0 ^ SEED) as u128) * ((ld8(b, n - 8) ^ P1 ^ (n as u64).wrapping_mul(P2)) as u128);
+        let (lo, hi) = (r as u64, (r >> 64) as u64);
+        (lo ^ hi, hi as u32)
+    } else {
+        (hid(b), fh(b, 0x9e37_79b9_7f4a_7c15) as u32)
+    }
 }
 
 #[inline(always)]
@@ -1235,6 +1379,11 @@ struct Ck {
     camp: u16,
 }
 
+const NB1: usize = 64; // event-id buckets for the dedup shuffle
+fn ebucket_of(h: u64) -> usize {
+    ((h.wrapping_mul(0x9E3779B97F4A7C15)) >> (64 - NB1.trailing_zeros())) as usize
+}
+
 fn bucket_of(h: u64) -> usize {
     ((h.wrapping_mul(0x9E3779B97F4A7C15)) >> 55) as usize % NB
 }
@@ -1263,6 +1412,8 @@ fn main() {
     eprintln!("lookups {:?}", t0.elapsed());
     let ws = lk.win_start;
     let we = lk.win_end;
+    let mpre = MonthPre::new(ws, we);
+    let mpre = &mpre;
 
     // ------------------------------------------------------------ events: parse
     let mut jobs = vec![];
@@ -1272,12 +1423,28 @@ fn main() {
         }
     }
 
-    let (links, parts): ((LinkTable, Vec<u64>, Files), Vec<Vec<Vec<Ev>>>) = rayon::join(|| build_links(&data), || jobs
+    // shared "seen" / "seen twice" bitmaps over event-id hashes: only ids seen twice need dedup
+    let ev_bytes: usize = evf.maps.iter().map(|m| m.len()).sum();
+    let bbits: usize = ((ev_bytes / 70).max(1024) * 16).next_power_of_two();
+    let bmask = bbits - 1;
+    let seen: Vec<std::sync::atomic::AtomicU64> = (0..bbits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let dupb: Vec<std::sync::atomic::AtomicU64> = (0..bbits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let mark = |bi: usize| {
+        let w = bi >> 6;
+        let bit = 1u64 << (bi & 63);
+        unsafe {
+            if seen.get_unchecked(w).fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit != 0 {
+                dupb.get_unchecked(w).fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    };
+    let (links, parts): ((LinkTable, Vec<u64>, Files), Vec<Vec<Ev>>) = rayon::join(|| build_links(&data), || jobs
         .par_iter()
         .map(|&(fi, s, e)| {
             let d = &evf.maps[fi][..];
-            let cap = (e - s) / 80 / NB * 5 / 4 + 16;
-            let mut b: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            let mut b: Vec<Ev> = Vec::with_capacity((e - s) / 70 + 64);
+            let mut ring = [0usize; 16];
+            let mut rn = 0usize;
             rows::<7>(d, s, e, |ls, line, fl| {
                 debug_assert!(fl.iter().all(|&(a, b)| a <= b && b as usize <= line.len()));
                 let f = |i: usize| unsafe { line.get_unchecked(fl[i].0 as usize..fl[i].1 as usize) };
@@ -1285,13 +1452,13 @@ fn main() {
                 if eid.is_empty() {
                     return;
                 }
-                let ingest = match parse_f1_trusted(f(3)) {
+                let ingest = match mpre.ingest(f(3)) {
                     Some(x) => x,
                     None => return, // never happens per rules
                 };
                 let uid = f(1);
                 let mut ok = !uid.is_empty();
-                let ts = parse_ts(f(2));
+                let ts = mpre.ts(f(2));
                 let ts = match ts {
                     Some(t) if t >= ws && t < we => t,
                     _ => {
@@ -1334,9 +1501,19 @@ fn main() {
                 } else {
                     (0, 0)
                 };
-                let h = hid(eid);
-                let h2 = fh(eid, 0x9e37_79b9_7f4a_7c15) as u32;
-                b[bucket_of(h)].push(Ev {
+                let (h, h2) = fh96(eid);
+                let bi = (h as usize) & bmask;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_ET0};
+                    _mm_prefetch(seen.as_ptr().add(bi >> 6) as *const i8, _MM_HINT_ET0);
+                }
+                if rn >= 16 {
+                    mark(ring[rn & 15]);
+                }
+                ring[rn & 15] = bi;
+                rn += 1;
+                b.push(Ev {
                     eid: h,
                     eid2: h2,
                     ingest: ((ingest - ws).div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
@@ -1346,6 +1523,9 @@ fn main() {
                     pk: price | ((kind as u32 & 3) << 24) | ((ok as u32) << 26),
                 });
             });
+            for k in rn.saturating_sub(16)..rn {
+                mark(ring[k & 15]);
+            }
             b
         })
         .collect());
@@ -1379,7 +1559,7 @@ fn main() {
                 if uid.is_empty() {
                     return;
                 }
-                let ts = match parse_ts(f(3)) {
+                let ts = match mpre.ts(f(3)) {
                     Some(t) if t >= ws - WEEK_MS && t < we => t,
                     _ => return,
                 };
@@ -1404,88 +1584,97 @@ fn main() {
         .collect();
     eprintln!("clicks parsed {:?}", t0.elapsed());
 
-    // ------------------------------------------------------------ dedup + validate, rebucket by person
-    // transpose [job][bucket] -> [bucket][job] so each bucket can be consumed and freed
-    let mut ebk: Vec<Vec<Vec<Ev>>> = (0..NB).map(|_| Vec::new()).collect();
-    for job in parts {
-        for (bi, v) in job.into_iter().enumerate() {
-            if !v.is_empty() {
-                ebk[bi].push(v);
-            }
-        }
+    // ------------------------------------------------------------ route events to persons; collect dedup candidates
+    // Every row whose id hash was seen twice is a candidate (real copies plus a few hash collisions).
+    // Candidates are resolved by event id; surviving rows go straight to their person bucket.
+    const NOLOC: u64 = u64::MAX;
+    #[derive(Clone, Copy)]
+    struct Cand {
+        eid: u64,
+        loc: u64, // person bucket << 40 | job << 20 | position, or NOLOC for a row that is dropped anyway
+        eid2: u32,
+        ingest: i32,
     }
-    let byperson: Vec<Vec<Vec<Sv>>> = ebk
+    let dupv: Vec<u64> = dupb.into_iter().map(|a| a.into_inner()).collect();
+    drop(seen);
+    assert!(parts.len() < (1 << 10), "too many parse jobs");
+    let routed: Vec<(Vec<Vec<Sv>>, Vec<Vec<Cand>>)> = parts
         .into_par_iter()
-        .map(|chunks| {
-            let n: usize = chunks.iter().map(|c| c.len()).sum();
-            let mut tt = std::time::Instant::now();
-            // rows stay in their parse chunks; refer to them as (chunk << 20) | position
-            assert!(chunks.len() < (1 << 12) && chunks.iter().all(|c| c.len() < (1 << 20)));
-            let at = |r: u32| -> &Ev { unsafe { chunks.get_unchecked((r >> 20) as usize).get_unchecked((r & 0xf_ffff) as usize) } };
-            // open-addressing table: event identity -> index of the copy with the smallest ingest_ts
-            tt = tm_add(0, tt);
-            let cap = (n * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            // compact table (4 bytes per slot): event identity -> row of the copy with the smallest ingest_ts
-            let mut table: Vec<u32> = vec![u32::MAX; cap];
-            for (ci, chunk) in chunks.iter().enumerate() {
-                for (pi, e) in chunk.iter().enumerate() {
-                    let r = ((ci as u32) << 20) | pi as u32;
-                    let mut slot = (e.eid as usize ^ (e.eid >> 32) as usize) & mask;
-                    loop {
-                        let cur = unsafe { *table.get_unchecked(slot) };
-                        if cur == u32::MAX {
-                            unsafe { *table.get_unchecked_mut(slot) = r };
-                            break;
-                        }
-                        let c = at(cur);
-                        if c.eid == e.eid && c.eid2 == e.eid2 {
-                            if e.ingest < c.ingest {
-                                unsafe { *table.get_unchecked_mut(slot) = r };
-                            }
-                            break;
-                        }
-                        slot = (slot + 1) & mask;
-                    }
-                }
-            }
+        .enumerate()
+        .map(|(ji, v)| {
+            let n = v.len();
             let ocap = n / NB * 5 / 4 + 16;
             let mut out: Vec<Vec<Sv>> = (0..NB).map(|_| Vec::with_capacity(ocap)).collect();
-            tt = tm_add(1, tt);
-            let mut kept: Vec<u32> = Vec::with_capacity(n);
-            for &idx in &table {
-                if idx == u32::MAX {
-                    continue;
+            let mut cands: Vec<Vec<Cand>> = (0..NB1).map(|_| Vec::new()).collect();
+            for i in 0..n {
+                if i + PF < n {
+                    let e2 = unsafe { v.get_unchecked(i + PF) };
+                    lk.link.prefetch(e2.person);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        _mm_prefetch(dupv.as_ptr().add(((e2.eid as usize) & bmask) >> 6) as *const i8, _MM_HINT_T0);
+                    }
                 }
-                let e = at(idx);
-                if !e.ok() || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
-                    continue;
+                let e = unsafe { v.get_unchecked(i) };
+                let bi = (e.eid as usize) & bmask;
+                let isdup = unsafe { *dupv.get_unchecked(bi >> 6) } >> (bi & 63) & 1 == 1;
+                let good = e.ok() && e.ingest as i64 * 1000 - e.ts as i64 <= LATE_MS;
+                let mut loc = NOLOC;
+                if good {
+                    let person = lk.link.person(e.person);
+                    let pb = bucket_of(person);
+                    let o = unsafe { out.get_unchecked_mut(pb) };
+                    loc = ((pb as u64) << 40) | ((ji as u64) << 20) | o.len() as u64;
+                    o.push(Sv { person, uref_cat: e.uref_cat, ts: e.ts, pk: e.pk & 0x03ff_ffff });
                 }
-                kept.push(idx);
+                if isdup {
+                    cands[ebucket_of(e.eid)].push(Cand { eid: e.eid, loc, eid2: e.eid2, ingest: e.ingest });
+                }
             }
-            let kn = kept.len();
-            tt = tm_add(2, tt);
-            for i in 0..kn {
-                if i + PF < kn {
-                    lk.link.prefetch(at(unsafe { *kept.get_unchecked(i + PF) }).person);
-                }
-                let e = at(unsafe { *kept.get_unchecked(i) });
-                let person = lk.link.person(e.person);
-                out[bucket_of(person)].push(Sv { person, uref_cat: e.uref_cat, ts: e.ts, pk: e.pk & 0x03ff_ffff });
-            }
-            tm_add(3, tt);
-            out
+            debug_assert!(out.iter().all(|o| o.len() < (1 << 20)));
+            (out, cands)
         })
         .collect();
-    eprintln!("dedup {:?}", t0.elapsed());
     let mut pbk: Vec<Vec<Vec<Sv>>> = (0..NB).map(|_| Vec::new()).collect();
-    for src in byperson {
-        for (bi, v) in src.into_iter().enumerate() {
+    let mut cbk2: Vec<Vec<Vec<Cand>>> = (0..NB1).map(|_| Vec::new()).collect();
+    for (out, cands) in routed {
+        for (bi, v) in out.into_iter().enumerate() {
+            pbk[bi].push(v); // keep empty chunks: chunk index == job index
+        }
+        for (bi, v) in cands.into_iter().enumerate() {
             if !v.is_empty() {
-                pbk[bi].push(v);
+                cbk2[bi].push(v);
             }
         }
     }
+    // resolve candidates: per event id keep the copy with the smallest ingest; every other copy loses
+    let mut losers: Vec<u64> = cbk2
+        .into_par_iter()
+        .flat_map_iter(|chunks| {
+            let mut all: Vec<Cand> = Vec::with_capacity(chunks.iter().map(|c| c.len()).sum());
+            for c in chunks {
+                all.extend_from_slice(&c);
+            }
+            all.sort_unstable_by_key(|c| (c.eid, c.eid2, c.ingest));
+            let mut lost = vec![];
+            let mut i = 0;
+            while i < all.len() {
+                let mut j = i + 1;
+                while j < all.len() && all[j].eid == all[i].eid && all[j].eid2 == all[i].eid2 {
+                    if all[j].loc != NOLOC {
+                        lost.push(all[j].loc);
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            lost.into_iter()
+        })
+        .collect();
+    losers.par_sort_unstable();
+    eprintln!("dedup {:?} losers={}", t0.elapsed(), losers.len());
+    let losers = &losers;
     let mut cbk: Vec<Vec<Vec<Ck>>> = (0..NB).map(|_| Vec::new()).collect();
     for job in cparts {
         for (bi, v) in job.into_iter().enumerate() {
@@ -1494,11 +1683,11 @@ fn main() {
             }
         }
     }
-    let mut work: Vec<(Vec<Vec<Sv>>, Vec<Vec<Ck>>)> = pbk.into_iter().zip(cbk.into_iter()).collect();
+    let mut work: Vec<(Vec<Vec<Sv>>, Vec<Vec<Ck>>, usize)> = pbk.into_iter().zip(cbk.into_iter()).enumerate().map(|(i, (e, c))| (e, c, i)).collect();
     // biggest buckets first: whales and shared-device people must not be the last job left
-    work.sort_unstable_by_key(|(e, c)| std::cmp::Reverse(e.iter().map(|x| x.len()).sum::<usize>() + c.iter().map(|x| x.len()).sum::<usize>()));
+    work.sort_unstable_by_key(|(e, c, _)| std::cmp::Reverse(e.iter().map(|x| x.len()).sum::<usize>() + c.iter().map(|x| x.len()).sum::<usize>()));
     if std::env::var_os("BUCKET_STATS").is_some() {
-        let mut sz: Vec<usize> = work.iter().map(|(e, _)| e.iter().map(|c| c.len()).sum::<usize>()).collect();
+        let mut sz: Vec<usize> = work.iter().map(|(e, _, _)| e.iter().map(|c| c.len()).sum::<usize>()).collect();
         let tot: usize = sz.iter().sum();
         sz.sort_unstable();
         eprintln!("buckets: total {} mean {} max {} top5 {:?}", tot, tot / NB, sz[NB - 1], &sz[NB - 5..]);
@@ -1513,7 +1702,28 @@ fn main() {
     let nthreads = rayon::current_num_threads().max(1);
     let accs: Vec<std::sync::Mutex<(Vec<UserRow>, Vec<[i64; 4]>)>> =
         (0..nthreads).map(|_| std::sync::Mutex::new((Vec::new(), vec![[0i64; 4]; ncamp * ndays]))).collect();
-    work.into_par_iter().with_max_len(1).for_each(|(evs, cks)| {
+    work.into_par_iter().with_max_len(1).for_each(|(mut evs, cks, pb)| {
+            // drop the copies that lost dedup
+            let lo = losers.partition_point(|&l| (l >> 40) < pb as u64);
+            let hi = losers.partition_point(|&l| (l >> 40) <= pb as u64);
+            if lo < hi {
+                let mut last = usize::MAX;
+                for &l in &losers[lo..hi] {
+                    let j = ((l >> 20) & 0xfffff) as usize;
+                    let p = (l & 0xfffff) as usize;
+                    evs[j][p].pk |= 1 << 30;
+                    last = j;
+                    let _ = last;
+                }
+                let mut k = lo;
+                while k < hi {
+                    let j = ((losers[k] >> 20) & 0xfffff) as usize;
+                    evs[j].retain(|x| x.pk & (1 << 30) == 0);
+                    while k < hi && ((losers[k] >> 20) & 0xfffff) as usize == j {
+                        k += 1;
+                    }
+                }
+            }
             let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
             let mut guard = accs[ti].lock().unwrap();
             let (rows, camp_stats) = &mut *guard;
@@ -1970,6 +2180,54 @@ mod tests {
             assert_eq!(parse_dt19(c.as_bytes()), reference(c.as_bytes()), "{c}");
         }
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn month_prefix_matches_parse_ts() {
+        let mut x: u64 = 0x5555_1234_abcd_0007;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789-T:Z +/aA\x00\xff9";
+        // windows including a leap February and a year end
+        for (ws, we) in [("2028-02-20T00:00:00Z", "2028-03-05T00:00:00Z"), ("2026-12-25T00:00:00Z", "2027-01-08T00:00:00Z"), ("2026-09-06T00:00:00Z", "2026-09-20T00:00:00Z")] {
+            let ws = parse_ts(ws.as_bytes()).unwrap();
+            let we = parse_ts(we.as_bytes()).unwrap();
+            let mp = MonthPre::new(ws, we);
+            assert!(mp.n >= 3);
+            for _ in 0..1_500_000u64 {
+                let t = ws + (rnd() % ((we - ws) as u64 + 8 * DAY_MS as u64)) as i64 - 4 * DAY_MS;
+                let (y, mo, d) = civil_from_days(t.div_euclid(DAY_MS));
+                let sod = t.rem_euclid(DAY_MS) / 1000;
+                let (mut h, mut mi, mut se) = (sod / 3600, sod / 60 % 60, sod % 60);
+                let (mut mo, mut d) = (mo, d);
+                match rnd() % 8 {
+                    0 => d = (rnd() % 33) as i64,
+                    1 => h = (rnd() % 26) as i64,
+                    2 => mi = (rnd() % 62) as i64,
+                    3 => se = (rnd() % 62) as i64,
+                    4 => mo = (rnd() % 14) as i64,
+                    _ => {}
+                }
+                let mut v = match rnd() % 3 {
+                    0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, se),
+                    1 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}", y, mo, d, h, mi, se, if rnd() % 2 == 0 { '+' } else { '-' }, rnd() % 25, rnd() % 61),
+                    _ => format!("{}", t),
+                }
+                .into_bytes();
+                if rnd() % 3 == 0 {
+                    let p = (rnd() % v.len() as u64) as usize;
+                    v[p] = alphabet[(rnd() % alphabet.len() as u64) as usize];
+                }
+                assert_eq!(mp.ts(&v), parse_ts(&v), "input {:?}", String::from_utf8_lossy(&v));
+                if v.len() == 20 && parse_ts(&v).is_some() {
+                    assert_eq!(mp.ingest(&v), parse_ts(&v), "ingest {:?}", String::from_utf8_lossy(&v));
+                }
+            }
+        }
     }
 
     #[test]
