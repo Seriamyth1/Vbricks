@@ -735,6 +735,7 @@ struct Lookups {
     unknown_cat: u16,
     cat_names: Vec<String>,
     camp: HMap<u16>,
+    camp_arr: Vec<u16>, // camp_arr[n] = index of "c_{n}" when every campaign id has that exact form
     camp_names: Vec<String>, // index 0 = organic
     camp_channel: Vec<String>,
     link: LinkTable, // id hash -> component
@@ -837,6 +838,27 @@ fn build_lookups(data: &Path) -> Lookups {
     let mut camp: HMap<u16> = HMap::with_capacity_and_hasher(crows.len() * 2, IdBuild::default());
     let mut camp_names = vec!["organic".to_string()];
     let mut camp_channel = vec!["organic".to_string()];
+    let ccanon = |id: &[u8]| -> Option<usize> {
+        if id.len() < 3 || id.len() > 9 || &id[..2] != b"c_" || id[2] == b'0' {
+            return None;
+        }
+        let mut v = 0usize;
+        for &c in &id[2..] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as usize;
+        }
+        Some(v)
+    };
+    let mut camp_arr: Vec<u16> = vec![];
+    if !crows.is_empty() && crows.iter().all(|r| ccanon(&r[0]).map(|v| v < 1_000_000).unwrap_or(false)) {
+        let maxv = crows.iter().map(|r| ccanon(&r[0]).unwrap()).max().unwrap();
+        camp_arr = vec![u16::MAX; maxv + 1];
+        for (i, r) in crows.iter().enumerate() {
+            camp_arr[ccanon(&r[0]).unwrap()] = (i + 1) as u16;
+        }
+    }
     for r in &crows {
         camp.insert(hid(&r[0]), camp_names.len() as u16);
         camp_names.push(String::from_utf8_lossy(&r[0]).into_owned());
@@ -851,6 +873,7 @@ fn build_lookups(data: &Path) -> Lookups {
         unknown_cat,
         cat_names,
         camp,
+        camp_arr,
         camp_names,
         camp_channel,
         link: LinkTable::new(0),
@@ -949,6 +972,14 @@ fn build_links(data: &Path) -> (LinkTable, Vec<u64>, Files) {
 
 const LINKED: u64 = 1 << 63;
 
+static TM: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+#[inline(always)]
+fn tm_add(i: usize, t: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    TM[i].fetch_add((now - t).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    now
+}
+
 /// Flat open-addressing table: linked-ID hash -> component. 16-byte slots, linear probing,
 /// so callers can prefetch the slot ahead of time and overlap the cache misses.
 struct LinkTable {
@@ -1025,6 +1056,31 @@ impl LinkTable {
 
 /// How far ahead to prefetch link-table slots.
 const PF: usize = 16;
+
+/// Index of a campaign id in campaigns.csv (1-based; 0 is organic), or None if unknown.
+#[inline]
+fn campaign_index(lk: &Lookups, cid: &[u8]) -> Option<u16> {
+    if !lk.camp_arr.is_empty() {
+        let n = cid.len();
+        if n >= 3 && n <= 9 && cid[0] == b'c' && cid[1] == b'_' && cid[2] != b'0' {
+            let mut v = 0usize;
+            let mut ok = true;
+            for &c in &cid[2..] {
+                let d = c.wrapping_sub(b'0');
+                ok &= d <= 9;
+                v = v * 10 + d as usize;
+            }
+            if ok {
+                return match lk.camp_arr.get(v) {
+                    Some(&c) if c != u16::MAX => Some(c),
+                    _ => None,
+                };
+            }
+        }
+        return None;
+    }
+    lk.camp.get(&hid(cid)).copied()
+}
 
 #[inline]
 fn product_category(lk: &Lookups, pid: &[u8]) -> u16 {
@@ -1265,8 +1321,8 @@ fn main() {
                     Some(t) if t >= ws - WEEK_MS && t < we => t,
                     _ => return,
                 };
-                let camp = match lk.camp.get(&hid(f(2))) {
-                    Some(&c) => c,
+                let camp = match campaign_index(&lk, f(2)) {
+                    Some(c) => c,
                     None => return,
                 };
                 tmp.push(Ck { person: hid(uid), ts, cref: mkref(fi, ls + fl[0].0 as usize, cid.len()), camp });
@@ -1300,26 +1356,31 @@ fn main() {
         .into_par_iter()
         .map(|chunks| {
             let n: usize = chunks.iter().map(|c| c.len()).sum();
+            let mut tt = std::time::Instant::now();
             let mut v: Vec<Ev> = Vec::with_capacity(n);
             for c in chunks {
                 v.extend_from_slice(&c);
             }
             // open-addressing table: event identity -> index of the copy with the smallest ingest_ts
+            tt = tm_add(0, tt);
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = cap - 1;
-            let mut table: Vec<u32> = vec![u32::MAX; cap];
+            // entry = [eid, (eid2 << 32) | (row + 1)], 0 = empty: a probe touches only the table;
+            // the row is read only when the same event shows up again (a duplicate)
+            let mut table: Vec<[u64; 2]> = vec![[0, 0]; cap];
             for (i, e) in v.iter().enumerate() {
+                let tag = ((e.eid2 as u64) << 32) | (i as u64 + 1);
                 let mut slot = (e.eid as usize ^ (e.eid >> 32) as usize) & mask;
                 loop {
-                    let cur = table[slot];
-                    if cur == u32::MAX {
-                        table[slot] = i as u32;
+                    let ent = unsafe { table.get_unchecked_mut(slot) };
+                    if ent[1] == 0 {
+                        *ent = [e.eid, tag];
                         break;
                     }
-                    let c = &v[cur as usize];
-                    if c.eid == e.eid && c.eid2 == e.eid2 {
-                        if e.ingest < c.ingest {
-                            table[slot] = i as u32;
+                    if ent[0] == e.eid && (ent[1] >> 32) as u32 == e.eid2 {
+                        let cur = (ent[1] as u32 - 1) as usize;
+                        if e.ingest < unsafe { v.get_unchecked(cur) }.ingest {
+                            ent[1] = tag;
                         }
                         break;
                     }
@@ -1328,18 +1389,31 @@ fn main() {
             }
             let ocap = n / NB * 5 / 4 + 16;
             let mut out: Vec<Vec<Sv>> = (0..NB).map(|_| Vec::with_capacity(ocap)).collect();
+            tt = tm_add(1, tt);
+            // mark kept copies in a small bitmap, then walk rows in order (sequential reads)
+            let mut keep = vec![0u64; (n + 63) / 64];
+            for ent in &table {
+                if ent[1] != 0 {
+                    let i = (ent[1] as u32 - 1) as usize;
+                    keep[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            drop(table);
             let mut kept: Vec<u32> = Vec::with_capacity(n);
-            for &idx in &table {
-                if idx == u32::MAX {
-                    continue;
+            for (w, &bits) in keep.iter().enumerate() {
+                let mut bb = bits;
+                while bb != 0 {
+                    let i = (w << 6) | bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    let e = unsafe { v.get_unchecked(i) };
+                    if e.ok == 0 || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
+                        continue;
+                    }
+                    kept.push(i as u32);
                 }
-                let e = unsafe { v.get_unchecked(idx as usize) };
-                if e.ok == 0 || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
-                    continue;
-                }
-                kept.push(idx);
             }
             let kn = kept.len();
+            tt = tm_add(2, tt);
             for i in 0..kn {
                 if i + PF < kn {
                     lk.link.prefetch(unsafe { v.get_unchecked(*kept.get_unchecked(i + PF) as usize) }.person);
@@ -1348,6 +1422,7 @@ fn main() {
                 let person = if exp == 10 { e.person & !LINKED } else { lk.link.person(e.person) };
                 out[bucket_of(person)].push(Sv { person, uref: e.uref, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
             }
+            tm_add(3, tt);
             out
         })
         .collect();
@@ -1389,6 +1464,7 @@ fn main() {
         .fold(|| (Vec::<UserRow>::new(), vec![[0i64; 4]; ncamp * ndays]), |(mut rows, mut camp_stats), (evs, cks)| {
             // One 128-bit key per event: person | ts | is-purchase | (chunk, position).
             // Sorting the keys orders the bucket; rows stay where they are (no concat, no gather).
+            let mut tt = std::time::Instant::now();
             let nev: usize = evs.iter().map(|c| c.len()).sum();
             let mut keys: Vec<u128> = Vec::with_capacity(nev);
             for (c, chunk) in evs.iter().enumerate() {
@@ -1411,6 +1487,7 @@ fn main() {
             let kperson = |k: u128| (k >> 64) as u64;
             let kts = |k: u128| ((k >> 32) as u32) as i32;
             let kpurch = |k: u128| (k >> 31) & 1 == 1;
+            tt = tm_add(4, tt);
             let mut ck: Vec<Ck> = Vec::with_capacity(cks.iter().map(|c| c.len()).sum());
             for c in cks {
                 ck.extend_from_slice(&c);
@@ -1428,8 +1505,12 @@ fn main() {
 
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = vec![];
-            let mut cnt: AHashMap<u16, u32> = AHashMap::new();
+            // campaigns with a click in the current 7-day window: counts + list of active ids
+            let mut cnt: Vec<u32> = vec![0; ncamp];
+            let mut active: Vec<u16> = Vec::with_capacity(64);
+            let mut apos: Vec<u32> = vec![0; ncamp];
 
+            tt = tm_add(5, tt);
             let mut ci = 0usize;
             let mut i = 0usize;
             while i < keys.len() {
@@ -1451,7 +1532,10 @@ fn main() {
                 let name_ref = if linked { lk.comp_name[(person & !LINKED) as usize] } else { row(events[0]).uref };
 
                 // sliding window over clicks for assists
-                cnt.clear();
+                for &c in &active {
+                    cnt[c as usize] = 0;
+                }
+                active.clear();
                 let (mut lo, mut hi) = (0usize, 0usize);
 
                 // current user-day accumulation
@@ -1503,14 +1587,24 @@ fn main() {
 
                     // credit: latest click with ts <= start and start - ts <= 7d
                     while hi < clicks.len() && clicks[hi].ts <= start {
-                        *cnt.entry(clicks[hi].camp).or_insert(0) += 1;
+                        let c = clicks[hi].camp as usize;
+                        if cnt[c] == 0 {
+                            apos[c] = active.len() as u32;
+                            active.push(c as u16);
+                        }
+                        cnt[c] += 1;
                         hi += 1;
                     }
                     while lo < hi && clicks[lo].ts < start - WEEK_MS {
-                        let c = cnt.get_mut(&clicks[lo].camp).unwrap();
-                        *c -= 1;
-                        if *c == 0 {
-                            cnt.remove(&clicks[lo].camp);
+                        let c = clicks[lo].camp as usize;
+                        cnt[c] -= 1;
+                        if cnt[c] == 0 {
+                            // swap-remove from the active list
+                            let p = apos[c] as usize;
+                            let last = *active.last().unwrap();
+                            active[p] = last;
+                            apos[last as usize] = p as u32;
+                            active.pop();
                         }
                         lo += 1;
                     }
@@ -1533,7 +1627,7 @@ fn main() {
                     st[0] += 1;
                     st[1] += purch as i64;
                     st[2] += rev;
-                    for (&c, _) in cnt.iter() {
+                    for &c in &active {
                         camp_stats[c as usize * ndays + d][3] += 1;
                     }
                     k = m;
@@ -1544,6 +1638,7 @@ fn main() {
                 i = j;
                 ci = cj;
             }
+            tm_add(6, tt);
             (rows, camp_stats)
         })
         .collect();
@@ -1567,6 +1662,12 @@ fn main() {
     // ------------------------------------------------------------ write
     write_outputs(&out, &lk, &evf, ws, ndays, results);
     eprintln!("done {:?}", t0.elapsed());
+    if std::env::var_os("TIMING").is_some() {
+        let names = ["dd.concat", "dd.table", "dd.filter", "dd.resolve+scatter", "ss.keys+sort", "ss.clicks", "ss.loop", "-"];
+        for (i, nm) in names.iter().enumerate() {
+            eprintln!("  {} {:.3}s", nm, TM[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
+        }
+    }
 }
 
 fn write_outputs(
