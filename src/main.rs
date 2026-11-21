@@ -1224,13 +1224,8 @@ fn main() {
             let d = &evf.maps[fi][..];
             let cap = (e - s) / 80 / NB * 5 / 4 + 16;
             let mut b: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
-            let mut cnt = 0u64;
             rows::<7>(d, s, e, |ls, line, fl| {
                 debug_assert!(fl.iter().all(|&(a, b)| a <= b && b as usize <= line.len()));
-                if exp == 1 || exp == 2 {
-                    cnt += fl[3].0 as u64;
-                    return;
-                }
                 let f = |i: usize| unsafe { line.get_unchecked(fl[i].0 as usize..fl[i].1 as usize) };
                 let eid = f(0);
                 if eid.is_empty() {
@@ -1281,14 +1276,10 @@ fn main() {
                     }
                 }
                 let (person, cat) = if ok {
-                    (hid(uid), product_category(&lk, pid))
+                    (hid(uid), if kind == 2 { product_category(&lk, pid) } else { 0 })
                 } else {
                     (0, 0)
                 };
-                if exp == 3 {
-                    cnt += (ingest ^ ts) as u64 + person + cat as u64 + price as u64;
-                    return;
-                }
                 let h = hid(eid);
                 let h2 = fh(eid, 0x9e37_79b9_7f4a_7c15) as u32;
                 b[bucket_of(h)].push(Ev {
@@ -1304,7 +1295,6 @@ fn main() {
                     ok: ok as u8,
                 });
             });
-            if cnt == 1 { eprintln!("x"); }
             b
         })
         .collect());
@@ -1427,7 +1417,7 @@ fn main() {
                     lk.link.prefetch(unsafe { v.get_unchecked(*kept.get_unchecked(i + PF) as usize) }.person);
                 }
                 let e = unsafe { v.get_unchecked(*kept.get_unchecked(i) as usize) };
-                let person = if exp == 10 { e.person & !LINKED } else { lk.link.person(e.person) };
+                let person = lk.link.person(e.person);
                 out[bucket_of(person)].push(Sv { person, uref: e.uref, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
             }
             tm_add(3, tt);
@@ -1679,6 +1669,10 @@ fn main() {
             eprintln!("  {} {:.3}s", nm, TM[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
         }
     }
+    // the OS reclaims everything at exit: skip freeing gigabytes of buffers one by one
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
 }
 
 fn write_outputs(
@@ -1700,7 +1694,13 @@ fn write_outputs(
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
     let day0 = ws.div_euclid(DAY_MS) as i32;
-    let props = || WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).set_dictionary_enabled(false).build();
+    let props = || {
+        WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+            .build()
+    };
 
     let uschema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
@@ -1738,7 +1738,7 @@ fn write_outputs(
         for rows in slice {
             for row in rows.iter() {
                 let b = if row.linked { lk.link_files.bytes(row.name_ref) } else { evf.bytes(row.name_ref) };
-                names.push(std::str::from_utf8(b).unwrap_or(""));
+                names.push(unsafe { std::str::from_utf8_unchecked(b) });
                 days.push(day0 + row.day);
                 s.push(row.sessions);
                 e.push(row.events);
