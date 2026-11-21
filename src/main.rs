@@ -1134,6 +1134,23 @@ impl std::hash::Hasher for IdHasher {
 type IdBuild = std::hash::BuildHasherDefault<IdHasher>;
 type HMap<V> = std::collections::HashMap<u64, V, IdBuild>;
 
+/// Multiply-mix hasher for u64 keys that may be small sequential numbers (linked person ids).
+#[derive(Default, Clone, Copy)]
+struct MixHasher(u64);
+impl std::hash::Hasher for MixHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!()
+    }
+    fn write_u64(&mut self, n: u64) {
+        let r = (n as u128) * 0x9E37_79B9_7F4A_7C15u128;
+        self.0 = (r as u64) ^ ((r >> 64) as u64);
+    }
+}
+type MixBuild = std::hash::BuildHasherDefault<MixHasher>;
+
 struct UserRow {
     name_ref: u64,
     linked: bool,
@@ -1464,46 +1481,114 @@ fn main() {
             let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
             let mut guard = accs[ti].lock().unwrap();
             let (rows, camp_stats) = &mut *guard;
-            // One 128-bit key per event: person | ts | is-purchase | (chunk, position).
-            // Sorting the keys orders the bucket; rows stay where they are (no concat, no gather).
+            // Group each person's events with a counting sort keyed by a small per-bucket person
+            // number, then order each person's few events by time. Entry = ts | is-purchase | row ref.
             let mut tt = std::time::Instant::now();
             let nev: usize = evs.iter().map(|c| c.len()).sum();
-            let mut keys: Vec<u128> = Vec::with_capacity(nev);
+            let mut pmap: std::collections::HashMap<u64, u32, MixBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(nev / 8 + 64, MixBuild::default());
+            let mut pkeys: Vec<u64> = Vec::with_capacity(nev / 8 + 64);
+            let mut pcount: Vec<u32> = Vec::with_capacity(nev / 8 + 64);
+            let mut rowpid: Vec<u32> = Vec::with_capacity(nev);
             for (c, chunk) in evs.iter().enumerate() {
                 assert!(c < (1 << 10) && chunk.len() < (1 << 21));
-                for (p, x) in chunk.iter().enumerate() {
-                    keys.push(
-                        ((x.person as u128) << 64)
-                            | ((x.ts as u32 as u128) << 32)
-                            | (((x.kind == 2) as u128) << 31)
-                            | ((c as u128) << 21)
-                            | p as u128,
-                    );
+                for x in chunk.iter() {
+                    let pid = *pmap.entry(x.person).or_insert_with(|| {
+                        pkeys.push(x.person);
+                        pcount.push(0);
+                        (pkeys.len() - 1) as u32
+                    });
+                    pcount[pid as usize] += 1;
+                    rowpid.push(pid);
                 }
             }
-            keys.sort_unstable();
-            let row = |k: u128| -> &Sv {
+            let np = pkeys.len();
+            let mut poff: Vec<u32> = Vec::with_capacity(np + 1);
+            let mut acc = 0u32;
+            for &c in &pcount {
+                poff.push(acc);
+                acc += c;
+            }
+            poff.push(acc);
+            let mut cur: Vec<u32> = poff[..np].to_vec();
+            let mut arr: Vec<u64> = vec![0u64; nev];
+            let mut ri = 0usize;
+            for (c, chunk) in evs.iter().enumerate() {
+                for (p, x) in chunk.iter().enumerate() {
+                    let pid = rowpid[ri] as usize;
+                    ri += 1;
+                    let at = cur[pid] as usize;
+                    cur[pid] += 1;
+                    arr[at] = ((x.ts as u32 as u64) << 32) | (((x.kind == 2) as u64) << 31) | ((c as u64) << 21) | p as u64;
+                }
+            }
+            drop(rowpid);
+            for pid in 0..np {
+                let g = &mut arr[poff[pid] as usize..poff[pid + 1] as usize];
+                if g.len() <= 24 {
+                    // insertion sort: persons have a few dozen events on average
+                    for x in 1..g.len() {
+                        let v = g[x];
+                        let mut y = x;
+                        while y > 0 && g[y - 1] > v {
+                            g[y] = g[y - 1];
+                            y -= 1;
+                        }
+                        g[y] = v;
+                    }
+                } else {
+                    g.sort_unstable();
+                }
+            }
+            let row = |k: u64| -> &Sv {
                 let r = k as u32 & 0x7fff_ffff;
                 unsafe { evs.get_unchecked((r >> 21) as usize).get_unchecked((r & 0x1f_ffff) as usize) }
             };
-            let kperson = |k: u128| (k >> 64) as u64;
-            let kts = |k: u128| ((k >> 32) as u32) as i32;
-            let kpurch = |k: u128| (k >> 31) & 1 == 1;
+            let kts = |k: u64| ((k >> 32) as u32) as i32;
+            let kpurch = |k: u64| (k >> 31) & 1 == 1;
             tt = tm_add(4, tt);
-            let mut ck: Vec<Ck> = Vec::with_capacity(cks.iter().map(|c| c.len()).sum());
-            for c in cks {
-                ck.extend_from_slice(&c);
+            // clicks: same person numbering; clicks of people with no events are irrelevant
+            let mut ccount: Vec<u32> = vec![0; np];
+            let mut cpid: Vec<u32> = Vec::with_capacity(cks.iter().map(|c| c.len()).sum());
+            for chunk in cks.iter() {
+                for x in chunk.iter() {
+                    let pid = match pmap.get(&x.person) {
+                        Some(&p) => p,
+                        None => u32::MAX,
+                    };
+                    if pid != u32::MAX {
+                        ccount[pid as usize] += 1;
+                    }
+                    cpid.push(pid);
+                }
             }
-            let ck: Vec<Ck> = {
-                let base = ws - WEEK_MS; // click ts >= window start - 7 days
-                let mut keys: Vec<u128> = ck
-                    .iter()
-                    .enumerate()
-                    .map(|(i, x)| ((x.person as u128) << 64) | (((x.ts - base) as u64 as u128) << 24) | i as u128)
-                    .collect();
-                keys.sort_unstable();
-                keys.iter().map(|k| ck[(*k as u32 & 0xff_ffff) as usize]).collect()
-            };
+            let mut coff: Vec<u32> = Vec::with_capacity(np + 1);
+            let mut acc = 0u32;
+            for &c in &ccount {
+                coff.push(acc);
+                acc += c;
+            }
+            coff.push(acc);
+            let mut ccur: Vec<u32> = coff[..np].to_vec();
+            let mut ck: Vec<Ck> = vec![Ck { person: 0, ts: 0, cref: 0, camp: 0 }; acc as usize];
+            let mut qi = 0usize;
+            for chunk in cks.iter() {
+                for x in chunk.iter() {
+                    let pid = cpid[qi];
+                    qi += 1;
+                    if pid != u32::MAX {
+                        let at = ccur[pid as usize] as usize;
+                        ccur[pid as usize] += 1;
+                        ck[at] = *x;
+                    }
+                }
+            }
+            for pid in 0..np {
+                let g = &mut ck[coff[pid] as usize..coff[pid + 1] as usize];
+                if g.len() > 1 {
+                    g.sort_unstable_by_key(|c| c.ts);
+                }
+            }
 
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = vec![];
@@ -1513,23 +1598,10 @@ fn main() {
             let mut apos: Vec<u32> = vec![0; ncamp];
 
             tt = tm_add(5, tt);
-            let mut ci = 0usize;
-            let mut i = 0usize;
-            while i < keys.len() {
-                let person = kperson(keys[i]);
-                let mut j = i;
-                while j < keys.len() && kperson(keys[j]) == person {
-                    j += 1;
-                }
-                while ci < ck.len() && ck[ci].person < person {
-                    ci += 1;
-                }
-                let mut cj = ci;
-                while cj < ck.len() && ck[cj].person == person {
-                    cj += 1;
-                }
-                let clicks = &ck[ci..cj];
-                let events = &keys[i..j];
+            for pid in 0..np {
+                let person = pkeys[pid];
+                let clicks = &ck[coff[pid] as usize..coff[pid + 1] as usize];
+                let events = &arr[poff[pid] as usize..poff[pid + 1] as usize];
                 let linked = person & LINKED != 0;
                 let name_ref = if linked { lk.comp_name[(person & !LINKED) as usize] } else { row(events[0]).uref };
 
@@ -1637,8 +1709,6 @@ fn main() {
                 if cur_day >= 0 {
                     rows.push(flush(name_ref, linked, cur_day, u_s, u_e, u_r, &mut catrev, &mut touched));
                 }
-                i = j;
-                ci = cj;
             }
             tm_add(6, tt);
         });
