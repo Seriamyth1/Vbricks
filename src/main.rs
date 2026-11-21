@@ -440,6 +440,23 @@ fn build_lookups(data: &Path) -> Lookups {
         camp_channel.push(String::from_utf8_lossy(&r[1]).into_owned());
     }
 
+    Lookups {
+        win_start,
+        win_end,
+        product_cat,
+        unknown_cat,
+        cat_names,
+        camp,
+        camp_names,
+        camp_channel,
+        link: HMap::default(),
+        comp_name: vec![],
+        link_files: Files { maps: vec![] },
+    }
+}
+
+/// Links -> union-find -> (id hash -> component, component -> ref of its name, the mapped files).
+fn build_links(data: &Path) -> (HMap<u32>, Vec<u64>, Files) {
     // links
     let paths = list_csv(&data.join("links"));
     let mut maps = vec![];
@@ -522,19 +539,7 @@ fn build_lookups(data: &Path) -> Lookups {
     for v in link.values_mut() {
         *v = comp_of[*v as usize];
     }
-    Lookups {
-        win_start,
-        win_end,
-        product_cat,
-        unknown_cat,
-        cat_names,
-        camp,
-        camp_names,
-        camp_channel,
-        link,
-        comp_name,
-        link_files: files,
-    }
+    (link, comp_name, files)
 }
 
 const LINKED: u64 = 1 << 63;
@@ -629,8 +634,8 @@ fn main() {
     let ckf = Arc::new(Files { maps: ck_maps });
 
     let exp: u32 = std::env::var("EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let lk = build_lookups(&data);
-    eprintln!("lookups {:?} links={} comps={}", t0.elapsed(), lk.link.len(), lk.comp_name.len());
+    let mut lk = build_lookups(&data);
+    eprintln!("lookups {:?}", t0.elapsed());
     let ws = lk.win_start;
     let we = lk.win_end;
 
@@ -641,7 +646,8 @@ fn main() {
             jobs.push((fi, s, e));
         }
     }
-    let parts: Vec<Vec<Vec<Ev>>> = jobs
+
+    let (links, parts): ((HMap<u32>, Vec<u64>, Files), Vec<Vec<Vec<Ev>>>) = rayon::join(|| build_links(&data), || jobs
         .par_iter()
         .map(|&(fi, s, e)| {
             let d = &evf.maps[fi][..];
@@ -692,7 +698,7 @@ fn main() {
                     }
                 }
                 let (person, cat) = if ok {
-                    (person_key(&lk, uid), *lk.product_cat.get(&xxh3_64(pid)).unwrap_or(&lk.unknown_cat))
+                    (xxh3_64(uid), *lk.product_cat.get(&xxh3_64(pid)).unwrap_or(&lk.unknown_cat))
                 } else {
                     (0, 0)
                 };
@@ -719,8 +725,11 @@ fn main() {
             if cnt == 1 { eprintln!("x"); }
             b
         })
-        .collect();
-    eprintln!("events parsed {:?}", t0.elapsed());
+        .collect());
+    lk.link = links.0;
+    lk.comp_name = links.1;
+    lk.link_files = links.2;
+    eprintln!("events parsed (+links) {:?} links={} comps={}", t0.elapsed(), lk.link.len(), lk.comp_name.len());
     if exp > 0 { return; }
 
     // ------------------------------------------------------------ clicks: parse
@@ -813,7 +822,11 @@ fn main() {
                 if e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
                     continue;
                 }
-                out[bucket_of(e.person)].push(Sv { person: e.person, uref: e.uref, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
+                let person = match lk.link.get(&e.person) {
+                    Some(&c) => LINKED | c as u64,
+                    None => e.person & !LINKED,
+                };
+                out[bucket_of(person)].push(Sv { person, uref: e.uref, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
             }
             out
         })
