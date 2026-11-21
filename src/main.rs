@@ -345,6 +345,17 @@ unsafe fn for_rows_avx2b<const N: usize>(data: &[u8], s: usize, e: usize, f: &mu
             return;
         }
         let mut fl = [(0u32, 0u32); N];
+        if qcount == 0 {
+            // no quotes on this line: fields are exactly the spans between commas
+            let mut st = 0u32;
+            for i in 0..N {
+                let en = if i + 1 < N { (*ends.get_unchecked(i) - line_start) as u32 } else { (line_end - line_start) as u32 };
+                *fl.get_unchecked_mut(i) = (st, en);
+                st = en + 1;
+            }
+            f(s + line_start, buf.get_unchecked(line_start..line_end), &fl);
+            return;
+        }
         let mut expect = 0u32;
         let mut st = line_start;
         for i in 0..N {
@@ -1239,10 +1250,20 @@ fn main() {
                         ws
                     }
                 };
-                let kind = match f(4) {
-                    b"view" => 0u8,
-                    b"cart" => 1,
-                    b"purchase" => 2,
+                let kf = f(4);
+                let kind = match kf.len() {
+                    4 => {
+                        let w = u32::from_le_bytes([kf[0], kf[1], kf[2], kf[3]]);
+                        if w == u32::from_le_bytes(*b"view") {
+                            0u8
+                        } else if w == u32::from_le_bytes(*b"cart") {
+                            1
+                        } else {
+                            ok = false;
+                            255
+                        }
+                    }
+                    8 if kf == b"purchase" => 2,
                     _ => {
                         ok = false;
                         255
@@ -1365,22 +1386,20 @@ fn main() {
             tt = tm_add(0, tt);
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = cap - 1;
-            // entry = [eid, (eid2 << 32) | (row + 1)], 0 = empty: a probe touches only the table;
-            // the row is read only when the same event shows up again (a duplicate)
-            let mut table: Vec<[u64; 2]> = vec![[0, 0]; cap];
+            // compact table (4 bytes per slot): event identity -> row of the copy with the smallest ingest_ts
+            let mut table: Vec<u32> = vec![u32::MAX; cap];
             for (i, e) in v.iter().enumerate() {
-                let tag = ((e.eid2 as u64) << 32) | (i as u64 + 1);
                 let mut slot = (e.eid as usize ^ (e.eid >> 32) as usize) & mask;
                 loop {
-                    let ent = unsafe { table.get_unchecked_mut(slot) };
-                    if ent[1] == 0 {
-                        *ent = [e.eid, tag];
+                    let cur = unsafe { *table.get_unchecked(slot) };
+                    if cur == u32::MAX {
+                        unsafe { *table.get_unchecked_mut(slot) = i as u32 };
                         break;
                     }
-                    if ent[0] == e.eid && (ent[1] >> 32) as u32 == e.eid2 {
-                        let cur = (ent[1] as u32 - 1) as usize;
-                        if e.ingest < unsafe { v.get_unchecked(cur) }.ingest {
-                            ent[1] = tag;
+                    let c = unsafe { v.get_unchecked(cur as usize) };
+                    if c.eid == e.eid && c.eid2 == e.eid2 {
+                        if e.ingest < c.ingest {
+                            unsafe { *table.get_unchecked_mut(slot) = i as u32 };
                         }
                         break;
                     }
@@ -1390,27 +1409,16 @@ fn main() {
             let ocap = n / NB * 5 / 4 + 16;
             let mut out: Vec<Vec<Sv>> = (0..NB).map(|_| Vec::with_capacity(ocap)).collect();
             tt = tm_add(1, tt);
-            // mark kept copies in a small bitmap, then walk rows in order (sequential reads)
-            let mut keep = vec![0u64; (n + 63) / 64];
-            for ent in &table {
-                if ent[1] != 0 {
-                    let i = (ent[1] as u32 - 1) as usize;
-                    keep[i >> 6] |= 1u64 << (i & 63);
-                }
-            }
-            drop(table);
             let mut kept: Vec<u32> = Vec::with_capacity(n);
-            for (w, &bits) in keep.iter().enumerate() {
-                let mut bb = bits;
-                while bb != 0 {
-                    let i = (w << 6) | bb.trailing_zeros() as usize;
-                    bb &= bb - 1;
-                    let e = unsafe { v.get_unchecked(i) };
-                    if e.ok == 0 || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
-                        continue;
-                    }
-                    kept.push(i as u32);
+            for &idx in &table {
+                if idx == u32::MAX {
+                    continue;
                 }
+                let e = unsafe { v.get_unchecked(idx as usize) };
+                if e.ok == 0 || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
+                    continue;
+                }
+                kept.push(idx);
             }
             let kn = kept.len();
             tt = tm_add(2, tt);
@@ -1458,10 +1466,14 @@ fn main() {
     let ndays = (((we - ws) + DAY_MS - 1) / DAY_MS) as usize;
     let ncat = lk.cat_names.len();
 
-    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = work
-        .into_par_iter()
-        .with_max_len(1)
-        .fold(|| (Vec::<UserRow>::new(), vec![[0i64; 4]; ncamp * ndays]), |(mut rows, mut camp_stats), (evs, cks)| {
+    // one accumulator per worker thread (not per bucket): each thread adds into its own table
+    let nthreads = rayon::current_num_threads().max(1);
+    let accs: Vec<std::sync::Mutex<(Vec<UserRow>, Vec<[i64; 4]>)>> =
+        (0..nthreads).map(|_| std::sync::Mutex::new((Vec::new(), vec![[0i64; 4]; ncamp * ndays]))).collect();
+    work.into_par_iter().with_max_len(1).for_each(|(evs, cks)| {
+            let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
+            let mut guard = accs[ti].lock().unwrap();
+            let (rows, camp_stats) = &mut *guard;
             // One 128-bit key per event: person | ts | is-purchase | (chunk, position).
             // Sorting the keys orders the bucket; rows stay where they are (no concat, no gather).
             let mut tt = std::time::Instant::now();
@@ -1639,9 +1651,8 @@ fn main() {
                 ci = cj;
             }
             tm_add(6, tt);
-            (rows, camp_stats)
-        })
-        .collect();
+        });
+    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = accs.into_iter().map(|m| m.into_inner().unwrap()).collect();
 
     fn flush(name_ref: u64, linked: bool, day: i32, s: i64, e: i64, r: i64, catrev: &mut [i64], touched: &mut Vec<u16>) -> UserRow {
         let mut top: i32 = -1;
