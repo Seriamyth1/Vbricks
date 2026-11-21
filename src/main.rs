@@ -34,16 +34,24 @@ struct Files {
 impl Files {
     #[inline]
     fn bytes(&self, r: u64) -> &[u8] {
-        let f = (r >> 52) as usize;
-        let off = ((r >> 12) & ((1u64 << 40) - 1)) as usize;
-        let len = (r & 0xfff) as usize;
-        &self.maps[f][off..off + len]
+        let f = ((r >> 40) & 0xff) as usize;
+        let off = ((r >> 8) & 0xffff_ffff) as usize;
+        let len = (r & 0xff) as usize;
+        let m = &self.maps[f][..];
+        if len < 255 {
+            &m[off..off + len]
+        } else {
+            // long value: it ends at the next comma, quote or newline (values never contain them)
+            let end = m[off..].iter().position(|&c| c == b',' || c == b'"' || c == b'\n').map(|p| off + p).unwrap_or(m.len());
+            &m[off..end]
+        }
     }
 }
 
 #[inline]
 fn mkref(file: usize, off: usize, len: usize) -> u64 {
-    ((file as u64) << 52) | ((off as u64) << 12) | (len.min(0xfff) as u64)
+    debug_assert!(file < 256 && off < (1usize << 32));
+    ((file as u64) << 40) | ((off as u64) << 8) | (len.min(255) as u64)
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -903,6 +911,7 @@ fn build_links(data: &Path) -> (LinkTable, Vec<u64>, Files) {
             maps.push(m);
         }
     }
+    assert!(maps.len() <= 256 && maps.iter().all(|m| m.len() < (1usize << 32)), "more than 256 link files or a file over 4 GB");
     let files = Files { maps };
     let mut jobs = vec![];
     for (fi, m) in files.maps.iter().enumerate() {
@@ -1170,28 +1179,53 @@ fn person_key(lk: &Lookups, uid: &[u8]) -> u64 {
 
 #[derive(Clone, Copy)]
 struct Ev {
-    eid: u64,    // event_id hash (64 bits)
-    person: u64,
-    uref: u64,   // user_id bytes (name of an unlinked person)
-    eid2: u32,   // second, independent 32-bit hash of event_id: 96-bit identity
-    ingest: i32, // seconds since window start
-    ts: i32,     // ms since window start (valid only if ok)
-    price: u32,
-    cat: u16,
-    kind: u8, // 0 view 1 cart 2 purchase
-    ok: u8,   // passes validation (except lateness)
+    eid: u64,      // event_id hash (64 bits)
+    person: u64,   // user_id hash (resolved to a person after links are ready)
+    uref_cat: u64, // user_id ref (48 bits) | category (16 bits)
+    eid2: u32,     // second, independent 32-bit hash of event_id: 96-bit identity
+    ingest: i32,   // seconds since window start
+    ts: i32,       // ms since window start (valid only if ok)
+    pk: u32,       // price (24 bits) | kind << 24 (2 bits) | ok << 26
 }
 
-/// A surviving event, routed to its person.
+impl Ev {
+    #[inline(always)]
+    fn ok(&self) -> bool {
+        (self.pk >> 26) & 1 == 1
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Ev>() == 40);
+
+/// A surviving event, routed to its person (24 bytes).
 #[derive(Clone, Copy)]
 struct Sv {
     person: u64,
-    uref: u64,
+    uref_cat: u64, // user_id ref (48 bits) | category (16 bits)
     ts: i32,
-    price: u32,
-    cat: u16,
-    kind: u8,
+    pk: u32, // price (24 bits) | kind << 24
 }
+
+impl Sv {
+    #[inline(always)]
+    fn kind(&self) -> u8 {
+        ((self.pk >> 24) & 3) as u8
+    }
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        self.pk & 0xff_ffff
+    }
+    #[inline(always)]
+    fn cat(&self) -> u16 {
+        (self.uref_cat >> 48) as u16
+    }
+    #[inline(always)]
+    fn uref(&self) -> u64 {
+        self.uref_cat & 0xffff_ffff_ffff
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Sv>() == 24);
 
 #[derive(Clone, Copy)]
 struct Ck {
@@ -1218,6 +1252,9 @@ fn main() {
     let ck_paths = list_csv(&data.join("clicks"));
     let ev_maps: Vec<Mmap> = ev_paths.iter().filter_map(|p| map_file(p)).collect();
     let ck_maps: Vec<Mmap> = ck_paths.iter().filter_map(|p| map_file(p)).collect();
+    for ms in [&ev_maps, &ck_maps] {
+        assert!(ms.len() <= 256 && ms.iter().all(|m| m.len() < (1usize << 32)), "more than 256 files or a file over 4 GB");
+    }
     let evf = Arc::new(Files { maps: ev_maps });
     let ckf = Arc::new(Files { maps: ck_maps });
 
@@ -1305,11 +1342,8 @@ fn main() {
                     ingest: ((ingest - ws).div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
                     ts: (ts - ws) as i32,
                     person,
-                    uref: mkref(fi, ls + fl[1].0 as usize, uid.len()),
-                    price,
-                    cat,
-                    kind,
-                    ok: ok as u8,
+                    uref_cat: mkref(fi, ls + fl[1].0 as usize, uid.len()) | ((cat as u64) << 48),
+                    pk: price | ((kind as u32 & 3) << 24) | ((ok as u32) << 26),
                 });
             });
             b
@@ -1385,32 +1419,34 @@ fn main() {
         .map(|chunks| {
             let n: usize = chunks.iter().map(|c| c.len()).sum();
             let mut tt = std::time::Instant::now();
-            let mut v: Vec<Ev> = Vec::with_capacity(n);
-            for c in chunks {
-                v.extend_from_slice(&c);
-            }
+            // rows stay in their parse chunks; refer to them as (chunk << 20) | position
+            assert!(chunks.len() < (1 << 12) && chunks.iter().all(|c| c.len() < (1 << 20)));
+            let at = |r: u32| -> &Ev { unsafe { chunks.get_unchecked((r >> 20) as usize).get_unchecked((r & 0xf_ffff) as usize) } };
             // open-addressing table: event identity -> index of the copy with the smallest ingest_ts
             tt = tm_add(0, tt);
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = cap - 1;
             // compact table (4 bytes per slot): event identity -> row of the copy with the smallest ingest_ts
             let mut table: Vec<u32> = vec![u32::MAX; cap];
-            for (i, e) in v.iter().enumerate() {
-                let mut slot = (e.eid as usize ^ (e.eid >> 32) as usize) & mask;
-                loop {
-                    let cur = unsafe { *table.get_unchecked(slot) };
-                    if cur == u32::MAX {
-                        unsafe { *table.get_unchecked_mut(slot) = i as u32 };
-                        break;
-                    }
-                    let c = unsafe { v.get_unchecked(cur as usize) };
-                    if c.eid == e.eid && c.eid2 == e.eid2 {
-                        if e.ingest < c.ingest {
-                            unsafe { *table.get_unchecked_mut(slot) = i as u32 };
+            for (ci, chunk) in chunks.iter().enumerate() {
+                for (pi, e) in chunk.iter().enumerate() {
+                    let r = ((ci as u32) << 20) | pi as u32;
+                    let mut slot = (e.eid as usize ^ (e.eid >> 32) as usize) & mask;
+                    loop {
+                        let cur = unsafe { *table.get_unchecked(slot) };
+                        if cur == u32::MAX {
+                            unsafe { *table.get_unchecked_mut(slot) = r };
+                            break;
                         }
-                        break;
+                        let c = at(cur);
+                        if c.eid == e.eid && c.eid2 == e.eid2 {
+                            if e.ingest < c.ingest {
+                                unsafe { *table.get_unchecked_mut(slot) = r };
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
                     }
-                    slot = (slot + 1) & mask;
                 }
             }
             let ocap = n / NB * 5 / 4 + 16;
@@ -1421,8 +1457,8 @@ fn main() {
                 if idx == u32::MAX {
                     continue;
                 }
-                let e = unsafe { v.get_unchecked(idx as usize) };
-                if e.ok == 0 || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
+                let e = at(idx);
+                if !e.ok() || e.ingest as i64 * 1000 - e.ts as i64 > LATE_MS {
                     continue;
                 }
                 kept.push(idx);
@@ -1431,11 +1467,11 @@ fn main() {
             tt = tm_add(2, tt);
             for i in 0..kn {
                 if i + PF < kn {
-                    lk.link.prefetch(unsafe { v.get_unchecked(*kept.get_unchecked(i + PF) as usize) }.person);
+                    lk.link.prefetch(at(unsafe { *kept.get_unchecked(i + PF) }).person);
                 }
-                let e = unsafe { v.get_unchecked(*kept.get_unchecked(i) as usize) };
+                let e = at(unsafe { *kept.get_unchecked(i) });
                 let person = lk.link.person(e.person);
-                out[bucket_of(person)].push(Sv { person, uref: e.uref, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
+                out[bucket_of(person)].push(Sv { person, uref_cat: e.uref_cat, ts: e.ts, pk: e.pk & 0x03ff_ffff });
             }
             tm_add(3, tt);
             out
@@ -1519,7 +1555,7 @@ fn main() {
                     ri += 1;
                     let at = cur[pid] as usize;
                     cur[pid] += 1;
-                    arr[at] = ((x.ts as u32 as u64) << 32) | (((x.kind == 2) as u64) << 31) | ((c as u64) << 21) | p as u64;
+                    arr[at] = ((x.ts as u32 as u64) << 32) | (((x.kind() == 2) as u64) << 31) | ((c as u64) << 21) | p as u64;
                 }
             }
             drop(rowpid);
@@ -1603,7 +1639,7 @@ fn main() {
                 let clicks = &ck[coff[pid] as usize..coff[pid + 1] as usize];
                 let events = &arr[poff[pid] as usize..poff[pid + 1] as usize];
                 let linked = person & LINKED != 0;
-                let name_ref = if linked { lk.comp_name[(person & !LINKED) as usize] } else { row(events[0]).uref };
+                let name_ref = if linked { lk.comp_name[(person & !LINKED) as usize] } else { row(events[0]).uref() };
 
                 // sliding window over clicks for assists
                 for &c in &active {
@@ -1647,12 +1683,12 @@ fn main() {
                         if kpurch(kk) {
                             let e = row(kk);
                             purch = true;
-                            rev += e.price as i64;
-                            let c = e.cat as usize;
+                            rev += e.price() as i64;
+                            let c = e.cat() as usize;
                             if catrev[c] == 0 {
-                                touched.push(e.cat);
+                                touched.push(e.cat());
                             }
-                            catrev[c] += e.price as i64;
+                            catrev[c] += e.price() as i64;
                         }
                     }
                     u_s += 1;
@@ -2005,5 +2041,27 @@ mod tests_f3 {
             for &c in b { let d = c.wrapping_sub(b'0'); v = if d > 9 { None } else { v.and_then(|v| v.checked_mul(10)).and_then(|v| v.checked_add(d as i64)) }; if v.is_none() { break; } }
             assert_eq!(parse_ts(b), v, "{s}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_ref {
+    use super::*;
+    #[test]
+    fn long_values_roundtrip() {
+        let dir = std::env::temp_dir().join("sessions_ref_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let long: String = std::iter::repeat('u').take(300).collect();
+        let text = format!("h\nab,{long},\"{long}\"\nxyz,short\n");
+        let p = dir.join("t.csv");
+        std::fs::write(&p, &text).unwrap();
+        let m = map_file(&p).unwrap();
+        let files = Files { maps: vec![m] };
+        let off = text.find(&long).unwrap();
+        assert_eq!(files.bytes(mkref(0, off, long.len())), long.as_bytes());
+        let off2 = text.rfind(&long).unwrap();
+        assert_eq!(files.bytes(mkref(0, off2, long.len())), long.as_bytes());
+        let off3 = text.find("short").unwrap();
+        assert_eq!(files.bytes(mkref(0, off3, 5)), b"short");
     }
 }
