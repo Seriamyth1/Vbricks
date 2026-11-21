@@ -9,12 +9,15 @@
 //!  6. write parquet
 
 use ahash::AHashMap;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
+
 
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
@@ -214,6 +217,213 @@ fn for_rows<const N: usize>(data: &[u8], s: usize, e: usize, mut f: impl FnMut(u
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let cm = _mm256_set1_epi8(b',' as i8);
+    let qt = _mm256_set1_epi8(b'"' as i8);
+    let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
+    (m(a, nl) | (m(b, nl) << 32), m(a, cm) | (m(b, cm) << 32), m(a, qt) | (m(b, qt) << 32))
+}
+
+/// AVX2 version of for_rows: classify 64 bytes at a time into newline / comma / quote bitmasks
+/// and walk the set bits. Same rules and output as for_rows.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn for_rows_avx2<const N: usize>(data: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, &[u8], &[(u32, u32); N])) {
+    let buf = &data[s..e];
+    let n = buf.len();
+    let mut fl = [(0u32, 0u32); N];
+    let mut line_start = 0usize;
+    let mut field_start = 0usize;
+    let mut k = 0usize;
+    let mut bad = false;
+    let mut quotes = 0u32;
+    let mut q_first = usize::MAX;
+    let mut q_last = 0usize;
+    let mut tail = [0u8; 64];
+    let mut base = 0usize;
+    while base < n {
+        let (nlm, cmm, qtm) = if base + 64 <= n {
+            masks64(buf.as_ptr().add(base))
+        } else {
+            let rem = n - base;
+            tail[..rem].copy_from_slice(&buf[base..]);
+            for x in tail[rem..].iter_mut() {
+                *x = 0;
+            }
+            masks64(tail.as_ptr())
+        };
+        let mut m = nlm | cmm | qtm;
+        while m != 0 {
+            let bit = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let pos = base + bit;
+            let b1 = 1u64 << bit;
+            if qtm & b1 != 0 {
+                quotes += 1;
+                if q_first == usize::MAX {
+                    q_first = pos;
+                }
+                q_last = pos;
+                continue;
+            }
+            // end of a field (comma or newline)
+            if pos > line_start || cmm & b1 != 0 {
+                let (a, b) = if quotes == 0 {
+                    (field_start, pos)
+                } else if quotes == 2 && q_first == field_start && q_last + 1 == pos && pos - field_start >= 2 {
+                    (field_start + 1, pos - 1)
+                } else {
+                    bad = true;
+                    (field_start, pos)
+                };
+                if k < N {
+                    *fl.get_unchecked_mut(k) = ((a - line_start) as u32, (b - line_start) as u32);
+                }
+                k += 1;
+            }
+            quotes = 0;
+            q_first = usize::MAX;
+            field_start = pos + 1;
+            if nlm & b1 != 0 {
+                if pos > line_start && !bad && k == N {
+                    f(s + line_start, &buf[line_start..pos], &fl);
+                }
+                line_start = pos + 1;
+                k = 0;
+                bad = false;
+            }
+        }
+        base += 64;
+    }
+    if line_start < n {
+        let pos = n;
+        let (a, b) = if quotes == 0 {
+            (field_start, pos)
+        } else if quotes == 2 && q_first == field_start && q_last + 1 == pos && pos - field_start >= 2 {
+            (field_start + 1, pos - 1)
+        } else {
+            bad = true;
+            (field_start, pos)
+        };
+        if k < N {
+            fl[k] = ((a - line_start) as u32, (b - line_start) as u32);
+        }
+        k += 1;
+        if !bad && k == N {
+            f(s + line_start, &buf[line_start..n], &fl);
+        }
+    }
+}
+
+/// Faster AVX2 tokenizer: walk only commas and newlines; validate quotes per line by count.
+/// A line is well-formed iff it has N fields and its quote count equals 2 x (fields that start
+/// and end with a quote, length >= 2) and no other field starts or ends with a quote.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn for_rows_avx2b<const N: usize>(data: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, &[u8], &[(u32, u32); N])) {
+    let buf = &data[s..e];
+    let n = buf.len();
+    let mut ends = [0usize; 16]; // comma positions in the current line (N <= 16)
+    let mut k = 0usize; // commas seen in this line
+    let mut line_start = 0usize;
+    let mut qcount = 0u32;
+    let mut tail = [0u8; 64];
+    let mut base = 0usize;
+
+    #[inline(always)]
+    unsafe fn finish<const N: usize>(
+        buf: &[u8], s: usize, line_start: usize, line_end: usize, ends: &[usize; 16], k: usize, qcount: u32,
+        f: &mut impl FnMut(usize, &[u8], &[(u32, u32); N]),
+    ) {
+        if line_end == line_start || k + 1 != N {
+            return;
+        }
+        let mut fl = [(0u32, 0u32); N];
+        let mut expect = 0u32;
+        let mut st = line_start;
+        for i in 0..N {
+            let en = if i + 1 < N { *ends.get_unchecked(i) } else { line_end };
+            let len = en - st;
+            let (a, b) = if len > 0 && *buf.get_unchecked(st) == b'"' {
+                if len < 2 || *buf.get_unchecked(en - 1) != b'"' {
+                    return;
+                }
+                expect += 2;
+                (st + 1, en - 1)
+            } else {
+                if len > 0 && *buf.get_unchecked(en - 1) == b'"' {
+                    return;
+                }
+                (st, en)
+            };
+            *fl.get_unchecked_mut(i) = ((a - line_start) as u32, (b - line_start) as u32);
+            st = en + 1;
+        }
+        if qcount != expect {
+            return;
+        }
+        f(s + line_start, buf.get_unchecked(line_start..line_end), &fl);
+    }
+
+    while base < n {
+        let (nlm, cmm, qtm) = if base + 64 <= n {
+            masks64(buf.as_ptr().add(base))
+        } else {
+            let rem = n - base;
+            tail[..rem].copy_from_slice(&buf[base..]);
+            for x in tail[rem..].iter_mut() {
+                *x = 0;
+            }
+            masks64(tail.as_ptr())
+        };
+        let mut qt_rem = qtm;
+        let mut m = nlm | cmm;
+        while m != 0 {
+            let bit = m.trailing_zeros();
+            m &= m - 1;
+            let pos = base + bit as usize;
+            if (nlm >> bit) & 1 != 0 {
+                let low = (1u64 << bit) - 1;
+                qcount += (qt_rem & low).count_ones();
+                qt_rem &= !low;
+                finish::<N>(buf, s, line_start, pos, &ends, k, qcount, f);
+                line_start = pos + 1;
+                k = 0;
+                qcount = 0;
+            } else {
+                if k < 16 {
+                    *ends.get_unchecked_mut(k) = pos;
+                }
+                k += 1;
+            }
+        }
+        qcount += qt_rem.count_ones();
+        base += 64;
+    }
+    if line_start < n {
+        finish::<N>(buf, s, line_start, n, &ends, k, qcount, f);
+    }
+}
+
+/// Dispatch: AVX2 when the CPU has it, else the portable version.
+#[inline]
+fn rows<const N: usize>(data: &[u8], s: usize, e: usize, mut f: impl FnMut(usize, &[u8], &[(u32, u32); N])) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::env::var_os("NO_AVX2").is_none() {
+            unsafe { for_rows_avx2b::<N>(data, s, e, &mut f) };
+            return;
+        }
+    }
+    for_rows::<N>(data, s, e, f);
+}
+
 /// Iterate lines in [s,e) of data; calls f(line_start, line_bytes).
 #[inline]
 fn for_lines(data: &[u8], s: usize, e: usize, mut f: impl FnMut(usize, &[u8])) {
@@ -257,36 +467,143 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// Days since 1970-01-01 of the first of each month, and the month's length, for 1900..2199.
+const TBL_Y0: i64 = 1900;
+const TBL_YEARS: usize = 300;
+const fn civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+const fn build_table() -> [(i32, u8); TBL_YEARS * 12] {
+    let mut t = [(0i32, 0u8); TBL_YEARS * 12];
+    let mut yi = 0;
+    while yi < TBL_YEARS {
+        let y = TBL_Y0 + yi as i64;
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let mut m = 1;
+        while m <= 12 {
+            let dim = match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                _ => if leap { 29 } else { 28 },
+            };
+            t[yi * 12 + (m as usize - 1)] = (civil(y, m, 1) as i32, dim);
+            m += 1;
+        }
+        yi += 1;
+    }
+    t
+}
+static MONTHS: [(i32, u8); TBL_YEARS * 12] = build_table();
+fn month_table() -> &'static [(i32, u8)] {
+    &MONTHS
+}
+
+/// Load 8 bytes at b[i..i+8] (little endian). Callers guarantee i + 8 <= b.len().
+#[inline(always)]
+fn ld8(b: &[u8], i: usize) -> u64 {
+    debug_assert!(i + 8 <= b.len());
+    unsafe { u64::from_le((b.as_ptr().add(i) as *const u64).read_unaligned()) }
+}
+#[inline(always)]
+fn ld4(b: &[u8], i: usize) -> u64 {
+    debug_assert!(i + 4 <= b.len());
+    unsafe { u32::from_le((b.as_ptr().add(i) as *const u32).read_unaligned()) as u64 }
+}
+
+/// SWAR check-and-convert: bytes at positions in `dmask` (0xFF per digit byte) must be ASCII digits.
+/// Returns the word with each digit byte replaced by its value, or None.
+#[inline(always)]
+fn swar_digits(w: u64, dmask: u64) -> Option<u64> {
+    let x = (w ^ 0x3030_3030_3030_3030) & dmask;
+    let bad = (((x & 0x7f7f_7f7f_7f7f_7f7f) + 0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 & dmask;
+    if bad != 0 {
+        None
+    } else {
+        Some(x)
+    }
+}
+
 /// Parse "YYYY-MM-DDTHH:MM:SS" prefix (19 bytes) into epoch ms.
 #[inline]
 fn parse_dt19(b: &[u8]) -> Option<i64> {
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 19 {
         return None;
     }
-    let y = dig2(b, 0)? * 100 + dig2(b, 2)?;
-    let mo = dig2(b, 5)?;
-    let d = dig2(b, 8)?;
-    let h = dig2(b, 11)?;
-    let mi = dig2(b, 14)?;
-    let s = dig2(b, 17)?;
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+    // "YYYY-MM-" | "DDTHH:MM" | (bytes 11..19) "HH:MM:SS"
+    let w0 = ld8(b, 0);
+    let w1 = ld8(b, 8);
+    let w2 = ld8(b, 11);
+    // separators: b4='-' b7='-' | b10='T' b13=':' | b16=':'
+    const S0: u64 = 0xff00_00ff_0000_0000; // bytes 4 and 7
+    const E0: u64 = 0x2d00_002d_0000_0000;
+    const S1: u64 = 0x0000_ff00_00ff_0000; // bytes 10 and 13 (positions 2 and 5 in w1)
+    const E1: u64 = 0x0000_3a00_0054_0000;
+    const S2: u64 = 0x0000_ff00_0000_0000; // byte 16 (position 5 in w2)
+    const E2: u64 = 0x0000_3a00_0000_0000;
+    if (w0 & S0) != E0 || (w1 & S1) != E1 || (w2 & S2) != E2 {
         return None;
     }
-    let dim = match mo {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if is_leap(y) {
-                29
-            } else {
-                28
-            }
+    let x0 = swar_digits(w0, 0x00ff_ff00_ffff_ffff)?; // YYYY MM
+    let x1 = swar_digits(w1, 0xffff_00ff_ff00_ffff)?; // DD HH MM
+    let x2 = swar_digits(w2, 0xffff_0000_0000_0000)?; // SS (bytes 17,18 = positions 6,7)
+    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xff) as i64;
+    let y = by(x0, 0) * 1000 + by(x0, 1) * 100 + by(x0, 2) * 10 + by(x0, 3);
+    let mo = by(x0, 5) * 10 + by(x0, 6);
+    let d = by(x1, 0) * 10 + by(x1, 1);
+    let h = by(x1, 3) * 10 + by(x1, 4);
+    let mi = by(x1, 6) * 10 + by(x1, 7);
+    let s = by(x2, 6) * 10 + by(x2, 7);
+    if mo < 1 || mo > 12 || h > 23 || mi > 59 || s > 59 || d < 1 {
+        return None;
+    }
+    let days = if y >= TBL_Y0 && y < TBL_Y0 + TBL_YEARS as i64 {
+        let (base, dim) = MONTHS[((y - TBL_Y0) * 12 + mo - 1) as usize];
+        if d > dim as i64 {
+            return None;
         }
+        base as i64 + d - 1
+    } else {
+        let dim = match mo {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => if is_leap(y) { 29 } else { 28 },
+        };
+        if d > dim {
+            return None;
+        }
+        days_from_civil(y, mo, d)
     };
-    if d > dim {
-        return None;
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+}
+
+/// ingest_ts is always valid F1 per the rules: convert without re-validating every field.
+/// Falls back to the full parser if the shape is not the expected 20-byte F1.
+#[inline]
+fn parse_f1_trusted(b: &[u8]) -> Option<i64> {
+    if b.len() != 20 || b[19] != b'Z' {
+        return parse_ts(b);
     }
-    Some(((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+    let w0 = ld8(b, 0) ^ 0x3030_3030_3030_3030;
+    let w1 = ld8(b, 8) ^ 0x3030_3030_3030_3030;
+    let w2 = ld8(b, 11) ^ 0x3030_3030_3030_3030;
+    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xff) as i64;
+    let y = by(w0, 0) * 1000 + by(w0, 1) * 100 + by(w0, 2) * 10 + by(w0, 3);
+    let mo = by(w0, 5) * 10 + by(w0, 6);
+    let d = by(w1, 0) * 10 + by(w1, 1);
+    let h = by(w1, 3) * 10 + by(w1, 4);
+    let mi = by(w1, 6) * 10 + by(w1, 7);
+    let s = by(w2, 6) * 10 + by(w2, 7);
+    if y < TBL_Y0 || y >= TBL_Y0 + TBL_YEARS as i64 || !(1..=12).contains(&mo) {
+        return parse_ts(b);
+    }
+    let days = MONTHS[((y - TBL_Y0) * 12 + mo - 1) as usize].0 as i64 + d - 1;
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1000)
 }
 
 /// F1, F2 or F3 -> epoch ms. None if bad form.
@@ -343,6 +660,49 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     } else {
         Some(v as u32)
     }
+}
+
+// ---------------------------------------------------------------- hashing
+
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128) * (b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+/// Fast hash for short IDs (wyhash-style). Exact for <= 16 bytes: two overlapping reads cover
+/// every byte, the length is mixed in.
+#[inline(always)]
+fn fh(b: &[u8], seed: u64) -> u64 {
+    const P0: u64 = 0xa076_1d64_78bd_642f;
+    const P1: u64 = 0xe703_7ed1_a0b4_28db;
+    const P2: u64 = 0x8ebc_6af0_9c88_c6e3;
+    let n = b.len();
+    let (a, c) = if n >= 8 {
+        if n <= 16 {
+            (ld8(b, 0), ld8(b, n - 8))
+        } else {
+            let mut acc = seed ^ P2;
+            let mut i = 0;
+            while i + 8 <= n {
+                acc = mum(acc ^ ld8(b, i), P1);
+                i += 8;
+            }
+            (acc, ld8(b, n - 8))
+        }
+    } else if n >= 4 {
+        (ld4(b, 0), ld4(b, n - 4))
+    } else if n > 0 {
+        ((b[0] as u64) | ((b[n / 2] as u64) << 8) | ((b[n - 1] as u64) << 16), 0)
+    } else {
+        (0, 0)
+    };
+    mum(a ^ P0 ^ seed, c ^ P1 ^ (n as u64).wrapping_mul(P2))
+}
+
+#[inline(always)]
+fn hid(b: &[u8]) -> u64 {
+    fh(b, 0x2d35_8dcc_aa6c_78a5)
 }
 
 // ---------------------------------------------------------------- lookups
@@ -425,7 +785,7 @@ fn build_lookups(data: &Path) -> Lookups {
     let unknown_cat = cat_idx[&b"unknown".to_vec()];
     let mut product_cat: HMap<u16> = HMap::with_capacity_and_hasher(prows.len() * 2, IdBuild::default());
     for r in &prows {
-        product_cat.insert(xxh3_64(&r[0]), cat_idx[&r[1]]);
+        product_cat.insert(hid(&r[0]), cat_idx[&r[1]]);
     }
     let cat_names = cats.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
 
@@ -435,7 +795,7 @@ fn build_lookups(data: &Path) -> Lookups {
     let mut camp_names = vec!["organic".to_string()];
     let mut camp_channel = vec!["organic".to_string()];
     for r in &crows {
-        camp.insert(xxh3_64(&r[0]), camp_names.len() as u16);
+        camp.insert(hid(&r[0]), camp_names.len() as u16);
         camp_names.push(String::from_utf8_lossy(&r[0]).into_owned());
         camp_channel.push(String::from_utf8_lossy(&r[1]).into_owned());
     }
@@ -477,7 +837,7 @@ fn build_links(data: &Path) -> (HMap<u32>, Vec<u64>, Files) {
         .map(|&(fi, s, e)| {
             let d = &files.maps[fi][..];
             let mut out = vec![];
-            for_rows::<2>(d, s, e, |ls, line, fl| {
+            rows::<2>(d, s, e, |ls, line, fl| {
                 let (a0, a1) = (fl[0].0 as usize, fl[0].1 as usize);
                 let (b0, b1) = (fl[1].0 as usize, fl[1].1 as usize);
                 if a0 == a1 || b0 == b1 {
@@ -485,7 +845,7 @@ fn build_links(data: &Path) -> (HMap<u32>, Vec<u64>, Files) {
                 }
                 let a = &line[a0..a1];
                 let b = &line[b0..b1];
-                out.push((xxh3_64(a), xxh3_64(b), mkref(fi, ls + a0, a1 - a0), mkref(fi, ls + b0, b1 - b0)));
+                out.push((hid(a), hid(b), mkref(fi, ls + a0, a1 - a0), mkref(fi, ls + b0, b1 - b0)));
             });
             out
         })
@@ -572,7 +932,7 @@ struct UserRow {
 
 #[inline]
 fn person_key(lk: &Lookups, uid: &[u8]) -> u64 {
-    let h = xxh3_64(uid);
+    let h = hid(uid);
     match lk.link.get(&h) {
         Some(&c) => LINKED | c as u64,
         None => h & !LINKED,
@@ -619,6 +979,7 @@ fn bucket_of(h: u64) -> usize {
 }
 
 fn main() {
+    let _ = month_table();
     let t0 = std::time::Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -651,9 +1012,10 @@ fn main() {
         .par_iter()
         .map(|&(fi, s, e)| {
             let d = &evf.maps[fi][..];
-            let mut b: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
+            let cap = (e - s) / 80 / NB * 5 / 4 + 16;
+            let mut b: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
             let mut cnt = 0u64;
-            for_rows::<7>(d, s, e, |ls, line, fl| {
+            rows::<7>(d, s, e, |ls, line, fl| {
                 if exp == 1 || exp == 2 {
                     cnt += fl[3].0 as u64;
                     return;
@@ -663,7 +1025,7 @@ fn main() {
                 if eid.is_empty() {
                     return;
                 }
-                let ingest = match parse_ts(f(3)) {
+                let ingest = match parse_f1_trusted(f(3)) {
                     Some(x) => x,
                     None => return, // never happens per rules
                 };
@@ -698,7 +1060,7 @@ fn main() {
                     }
                 }
                 let (person, cat) = if ok {
-                    (xxh3_64(uid), *lk.product_cat.get(&xxh3_64(pid)).unwrap_or(&lk.unknown_cat))
+                    (hid(uid), *lk.product_cat.get(&hid(pid)).unwrap_or(&lk.unknown_cat))
                 } else {
                     (0, 0)
                 };
@@ -706,9 +1068,8 @@ fn main() {
                     cnt += (ingest ^ ts) as u64 + person + cat as u64 + price as u64;
                     return;
                 }
-                let h128 = xxh3_128(eid);
-                let h = h128 as u64;
-                let h2 = (h128 >> 64) as u32;
+                let h = hid(eid);
+                let h2 = fh(eid, 0x9e37_79b9_7f4a_7c15) as u32;
                 b[bucket_of(h)].push(Ev {
                     eid: h,
                     eid2: h2,
@@ -743,8 +1104,9 @@ fn main() {
         .par_iter()
         .map(|&(fi, s, e)| {
             let d = &ckf.maps[fi][..];
-            let mut b: Vec<Vec<Ck>> = (0..NB).map(|_| Vec::new()).collect();
-            for_rows::<4>(d, s, e, |ls, line, fl| {
+            let cap = (e - s) / 40 / NB * 5 / 4 + 16;
+            let mut b: Vec<Vec<Ck>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            rows::<4>(d, s, e, |ls, line, fl| {
                 let f = |i: usize| &line[fl[i].0 as usize..fl[i].1 as usize];
                 let cid = f(0);
                 if cid.is_empty() {
@@ -758,7 +1120,7 @@ fn main() {
                     Some(t) if t >= ws - WEEK_MS && t < we => t,
                     _ => return,
                 };
-                let camp = match lk.camp.get(&xxh3_64(f(2))) {
+                let camp = match lk.camp.get(&hid(f(2))) {
                     Some(&c) => c,
                     None => return,
                 };
@@ -810,7 +1172,8 @@ fn main() {
                     slot = (slot + 1) & mask;
                 }
             }
-            let mut out: Vec<Vec<Sv>> = (0..NB).map(|_| Vec::new()).collect();
+            let ocap = n / NB * 5 / 4 + 16;
+            let mut out: Vec<Vec<Sv>> = (0..NB).map(|_| Vec::with_capacity(ocap)).collect();
             for &idx in &table {
                 if idx == u32::MAX {
                     continue;
@@ -848,7 +1211,15 @@ fn main() {
             }
         }
     }
-    let work: Vec<(Vec<Vec<Sv>>, Vec<Vec<Ck>>)> = pbk.into_iter().zip(cbk.into_iter()).collect();
+    let mut work: Vec<(Vec<Vec<Sv>>, Vec<Vec<Ck>>)> = pbk.into_iter().zip(cbk.into_iter()).collect();
+    // biggest buckets first: whales and shared-device people must not be the last job left
+    work.sort_unstable_by_key(|(e, c)| std::cmp::Reverse(e.iter().map(|x| x.len()).sum::<usize>() + c.iter().map(|x| x.len()).sum::<usize>()));
+    if std::env::var_os("BUCKET_STATS").is_some() {
+        let mut sz: Vec<usize> = work.iter().map(|(e, _)| e.iter().map(|c| c.len()).sum::<usize>()).collect();
+        let tot: usize = sz.iter().sum();
+        sz.sort_unstable();
+        eprintln!("buckets: total {} mean {} max {} top5 {:?}", tot, tot / NB, sz[NB - 1], &sz[NB - 5..]);
+    }
 
     // ------------------------------------------------------------ sessions per person bucket
     let ncamp = lk.camp_names.len();
@@ -857,17 +1228,36 @@ fn main() {
 
     let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = work
         .into_par_iter()
+        .with_max_len(1)
         .fold(|| (Vec::<UserRow>::new(), vec![[0i64; 4]; ncamp * ndays]), |(mut rows, mut camp_stats), (evs, cks)| {
             let mut ev: Vec<Sv> = Vec::with_capacity(evs.iter().map(|c| c.len()).sum());
             for c in evs {
                 ev.extend_from_slice(&c);
             }
-            ev.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
+            // sort plain 128-bit keys (person, ts, position), then gather: far cheaper than sorting records
+            let ev: Vec<Sv> = {
+                let mut keys: Vec<u128> = ev
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| ((x.person as u128) << 64) | ((x.ts as u32 as u128) << 32) | i as u128)
+                    .collect();
+                keys.sort_unstable();
+                keys.iter().map(|k| ev[(*k as u32) as usize]).collect()
+            };
             let mut ck: Vec<Ck> = Vec::with_capacity(cks.iter().map(|c| c.len()).sum());
             for c in cks {
                 ck.extend_from_slice(&c);
             }
-            ck.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
+            let ck: Vec<Ck> = {
+                let base = ws - WEEK_MS; // click ts >= window start - 7 days
+                let mut keys: Vec<u128> = ck
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| ((x.person as u128) << 64) | (((x.ts - base) as u64 as u128) << 24) | i as u128)
+                    .collect();
+                keys.sort_unstable();
+                keys.iter().map(|k| ck[(*k as u32 & 0xff_ffff) as usize]).collect()
+            };
 
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = vec![];
@@ -1131,3 +1521,121 @@ fn write_outputs(
     w.close().unwrap();
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference(b: &[u8]) -> Option<i64> {
+        if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+            return None;
+        }
+        let d2 = |i: usize| -> Option<i64> {
+            let a = b[i].wrapping_sub(b'0');
+            let c = b[i + 1].wrapping_sub(b'0');
+            if a > 9 || c > 9 { None } else { Some((a * 10 + c) as i64) }
+        };
+        let y = d2(0)? * 100 + d2(2)?;
+        let mo = d2(5)?;
+        let d = d2(8)?;
+        let h = d2(11)?;
+        let mi = d2(14)?;
+        let s = d2(17)?;
+        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+            return None;
+        }
+        let dim = match mo { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, _ => if is_leap(y) { 29 } else { 28 } };
+        if d > dim {
+            return None;
+        }
+        Some(((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+    }
+
+    #[test]
+    fn dt19_matches_reference() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789-T:Z +/aA\x00\xff9";
+        let mut checked = 0u64;
+        for _ in 0..4_000_000u64 {
+            let y = 1890 + rnd() % 330;
+            let mo = rnd() % 14;
+            let d = rnd() % 33;
+            let h = rnd() % 26;
+            let mi = rnd() % 62;
+            let s = rnd() % 62;
+            let mut v = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s).into_bytes();
+            // corrupt some bytes sometimes
+            let k = rnd() % 4;
+            for _ in 0..k {
+                let p = (rnd() % 19) as usize;
+                v[p] = alphabet[(rnd() % alphabet.len() as u64) as usize];
+            }
+            assert_eq!(parse_dt19(&v), reference(&v), "input {:?}", String::from_utf8_lossy(&v));
+            checked += 1;
+        }
+        // a few fixed cases
+        for c in ["2028-02-29T00:00:00Z", "2027-02-29T00:00:00Z", "2026-13-01T00:00:00Z", "2026-10-03T24:00:00Z", "2026-10-03T23:59:60Z", "2000-02-29T12:00:00Z", "1900-02-29T12:00:00Z"] {
+            assert_eq!(parse_dt19(c.as_bytes()), reference(c.as_bytes()), "{c}");
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn tokenizer_matches_reference() {
+        let mut x: u64 = 0xdead_beef_1234_5678;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let pieces: [&[u8]; 14] = [b"a", b"bc", b"\"q\"", b"\"\"", b"\"", b",", b",", b",", b"\n", b"x\"y", b"\r", b" ", b"123", b"\"z"];
+        for round in 0..3000 {
+            let mut buf = Vec::new();
+            let len = 1 + (rnd() % 400) as usize;
+            while buf.len() < len {
+                if rnd() % 5 == 0 {
+                    // a well-formed 7-field line
+                    for i in 0..7 {
+                        if i > 0 { buf.push(b','); }
+                        match rnd() % 4 { 0 => buf.extend_from_slice(b"\"v\""), 1 => {}, 2 => buf.extend_from_slice(b"abc"), _ => buf.extend_from_slice(b"\"\"") }
+                    }
+                    buf.push(b'\n');
+                } else {
+                    buf.extend_from_slice(pieces[(rnd() % pieces.len() as u64) as usize]);
+                }
+            }
+            for &cut in &[buf.len(), buf.len().saturating_sub(1)] {
+                let mut a = vec![];
+                for_rows::<7>(&buf, 0, cut, |ls, line, fl| a.push((ls, line.to_vec(), *fl)));
+                let mut b = vec![];
+                unsafe { for_rows_avx2b::<7>(&buf, 0, cut, &mut |ls, line: &[u8], fl: &[(u32, u32); 7]| b.push((ls, line.to_vec(), *fl))) };
+                assert_eq!(a, b, "round {round}: {:?}", String::from_utf8_lossy(&buf[..cut]));
+                let mut a2 = vec![];
+                for_rows::<2>(&buf, 0, cut, |ls, line, fl| a2.push((ls, line.to_vec(), *fl)));
+                let mut b2 = vec![];
+                unsafe { for_rows_avx2b::<2>(&buf, 0, cut, &mut |ls, line: &[u8], fl: &[(u32, u32); 2]| b2.push((ls, line.to_vec(), *fl))) };
+                assert_eq!(a2, b2, "round {round} N=2");
+            }
+        }
+    }
+
+    #[test]
+    fn hash_distinguishes_short_ids() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for i in 0..2_000_000u64 {
+            let s = format!("u{}", i);
+            assert!(seen.insert(hid(s.as_bytes())), "collision at {s}");
+        }
+        assert_ne!(hid(b""), hid(b"\0"));
+        assert_ne!(hid(b"ab"), hid(b"ba"));
+        assert_ne!(hid(b"abc"), hid(b"acb"));
+    }
+}
