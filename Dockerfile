@@ -12,4 +12,5 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/sessions /app/sessions
 RUN chmod 755 /app/sessions
+ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 CMD ["/app/sessions"]
