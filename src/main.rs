@@ -1291,37 +1291,41 @@ fn tm_add(i: usize, t: std::time::Instant) -> std::time::Instant {
 struct LinkTable {
     shift: u32,
     mask: usize,
-    slots: Vec<[u64; 2]>,
+    slots: Vec<u64>, // tag (top 41 bits of the id hash, never 0) << 23 | component (23 bits); 0 = empty
     len: usize,
 }
 
-const LT_EMPTY: u64 = u64::MAX;
+const LT_VBITS: u32 = 23;
 
+/// Flat open-addressing table: linked-ID hash -> component. 8-byte slots (16 MB for ~1.2M ids)
+/// so it has a chance to stay in cache; linear probing, prefetchable.
 impl LinkTable {
     fn new(n: usize) -> Self {
-        let cap = (n * 2).next_power_of_two().max(16);
-        LinkTable { shift: 64 - cap.trailing_zeros(), mask: cap - 1, slots: vec![[LT_EMPTY, 0]; cap], len: 0 }
+        let cap = (n * 3 / 2).next_power_of_two().max(16);
+        LinkTable { shift: 64 - cap.trailing_zeros(), mask: cap - 1, slots: vec![0u64; cap], len: 0 }
     }
     #[inline(always)]
-    fn key(k: u64) -> u64 {
-        if k == LT_EMPTY { LT_EMPTY - 1 } else { k }
+    fn tag(k: u64) -> u64 {
+        let t = k >> LT_VBITS;
+        (if t == 0 { 1 } else { t }) << LT_VBITS
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        (Self::key(k).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
     }
     fn insert(&mut self, k: u64, v: u32) {
-        let k = Self::key(k);
+        assert!((v as u64) < (1u64 << LT_VBITS), "too many link components");
+        let t = Self::tag(k);
         let mut i = self.slot(k);
         loop {
             let s = &mut self.slots[i];
-            if s[0] == LT_EMPTY {
-                *s = [k, v as u64];
+            if *s == 0 {
+                *s = t | v as u64;
                 self.len += 1;
                 return;
             }
-            if s[0] == k {
-                s[1] = v as u64;
+            if *s & !((1u64 << LT_VBITS) - 1) == t {
+                *s = t | v as u64;
                 return;
             }
             i = (i + 1) & self.mask;
@@ -1329,14 +1333,14 @@ impl LinkTable {
     }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u32> {
-        let k = Self::key(k);
+        let t = Self::tag(k);
         let mut i = self.slot(k);
         loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            if s[0] == k {
-                return Some(s[1] as u32);
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s & !((1u64 << LT_VBITS) - 1) == t {
+                return Some((s & ((1u64 << LT_VBITS) - 1)) as u32);
             }
-            if s[0] == LT_EMPTY {
+            if s == 0 {
                 return None;
             }
             i = (i + 1) & self.mask;
@@ -1567,7 +1571,7 @@ fn main() {
 
     // shared "seen" / "seen twice" bitmaps over event-id hashes: only ids seen twice need dedup
     let ev_bytes: usize = evf.maps.iter().map(|m| m.len()).sum();
-    let bbits: usize = ((ev_bytes / 70).max(1024) * 16).next_power_of_two();
+    let bbits: usize = ((ev_bytes / 70).max(1024) * 4).next_power_of_two();
     let bmask = bbits - 1;
     let seen: Vec<std::sync::atomic::AtomicU64> = (0..bbits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     let dupb: Vec<std::sync::atomic::AtomicU64> = (0..bbits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
