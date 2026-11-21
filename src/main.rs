@@ -426,13 +426,155 @@ unsafe fn for_rows_avx2b<const N: usize>(data: &[u8], s: usize, e: usize, f: &mu
     }
 }
 
+/// Field ends of the line starting at `p` (common shape only): a field is plain bytes up to the
+/// next comma, or `"bytes"` then a comma; the last field ends at `\n`. One 32-byte compare per
+/// field; the quoted/unquoted choice is branch-free. Returns (shape ok, start of next line).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1")]
+#[inline]
+unsafe fn line_fast<const N: usize>(base: *const u8, p: usize, fl: &mut [(u32, u32); N]) -> (bool, usize) {
+    use std::arch::x86_64::*;
+    let cm = _mm256_set1_epi8(b',' as i8);
+    let qt = _mm256_set1_epi8(b'"' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let mut q = p;
+    let mut ok = true;
+    for i in 0..N {
+        let isq = (*base.add(q) == b'"') as usize;
+        let st = q + isq;
+        let v = _mm256_loadu_si256(base.add(st) as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, cm), _mm256_cmpeq_epi8(v, qt)), _mm256_cmpeq_epi8(v, nl))) as u32;
+        let pos = st + (m.trailing_zeros() as usize & 31);
+        let term = if i + 1 < N { b',' } else { b'\n' };
+        let want = if isq == 1 { b'"' } else { term };
+        ok &= (m != 0) & (*base.add(pos) == want) & (*base.add(pos + isq) == term);
+        *fl.get_unchecked_mut(i) = ((st - p) as u32, (pos - p) as u32);
+        q = pos + isq + 1;
+    }
+    (ok, q)
+}
+
+/// line_fast for 4 independent lines at once, field by field, so the 4 dependency chains
+/// interleave in the instruction stream and the CPU overlaps their latencies.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1")]
+#[inline]
+unsafe fn line_fast4<const N: usize>(base: *const u8, p: [usize; 4], fl: &mut [[(u32, u32); N]; 4]) -> ([bool; 4], [usize; 4]) {
+    use std::arch::x86_64::*;
+    let cm = _mm256_set1_epi8(b',' as i8);
+    let qt = _mm256_set1_epi8(b'"' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let mut q = p;
+    let mut ok = [true; 4];
+    for i in 0..N {
+        let term = if i + 1 < N { b',' } else { b'\n' };
+        let mut isq = [0usize; 4];
+        let mut st = [0usize; 4];
+        let mut m = [0u32; 4];
+        for k in 0..4 {
+            isq[k] = (*base.add(q[k]) == b'"') as usize;
+            st[k] = q[k] + isq[k];
+        }
+        for k in 0..4 {
+            let v = _mm256_loadu_si256(base.add(st[k]) as *const __m256i);
+            m[k] = _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, cm), _mm256_cmpeq_epi8(v, qt)), _mm256_cmpeq_epi8(v, nl))) as u32;
+        }
+        for k in 0..4 {
+            let pos = st[k] + (m[k].trailing_zeros() as usize & 31);
+            let want = if isq[k] == 1 { b'"' } else { term };
+            ok[k] &= (m[k] != 0) & (*base.add(pos) == want) & (*base.add(pos + isq[k]) == term);
+            *fl.get_unchecked_mut(k).get_unchecked_mut(i) = ((st[k] - p[k]) as u32, (pos - p[k]) as u32);
+            q[k] = pos + isq[k] + 1;
+        }
+    }
+    (ok, q)
+}
+
+const FAST_GUARD: usize = 64 + 34 * 16;
+
+/// One line from `p`: fast shape, or the reference splitter for that one line. Returns next p.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1")]
+#[inline]
+unsafe fn emit_line<const N: usize>(data: &[u8], p: usize, e: usize, ok: bool, q: usize, fl: &[(u32, u32); N], f: &mut impl FnMut(usize, &[u8], &[(u32, u32); N])) -> usize {
+    if ok {
+        f(p, std::slice::from_raw_parts(data.as_ptr().add(p), q - 1 - p), fl);
+        q
+    } else {
+        let le = match memchr::memchr(b'\n', &data[p..e]) {
+            Some(x) => p + x + 1,
+            None => e,
+        };
+        for_rows::<N>(data, p, le, &mut *f);
+        le
+    }
+}
+
+/// One-pass splitter. Each chunk is cut into 4 parts at line starts and the parts are walked in
+/// lockstep: finding a line's field ends is a chain of dependent loads, and 4 independent chains
+/// let the CPU overlap them. Unusual lines (stray quote, wrong field count, a field over 31 bytes,
+/// empty line) and part tails go line by line to the reference splitter, so output is identical
+/// (rows come out in a different order, which nothing depends on).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1")]
+unsafe fn for_rows_fast<const N: usize>(data: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, &[u8], &[(u32, u32); N])) {
+    const K: usize = 4;
+    let base = data.as_ptr();
+    // part boundaries at line starts
+    let mut bnd = [e; K + 1];
+    bnd[0] = s;
+    for k in 1..K {
+        let t = (s + (e - s) * k / K).max(bnd[k - 1]);
+        bnd[k] = match memchr::memchr(b'\n', &data[t..e]) {
+            Some(x) if t > s => t + x + 1,
+            _ if t == s => s,
+            _ => e,
+        };
+    }
+    let mut c = [0usize; K];
+    let mut end = [0usize; K];
+    for k in 0..K {
+        c[k] = bnd[k];
+        end[k] = bnd[k + 1];
+    }
+    let mut fl = [[(0u32, 0u32); N]; K];
+    loop {
+        let mut room = true;
+        for k in 0..K {
+            room &= c[k] + FAST_GUARD <= end[k];
+        }
+        if !room {
+            break;
+        }
+        let (ok, q) = line_fast4::<N>(base, c, &mut fl);
+        for k in 0..K {
+            c[k] = emit_line::<N>(data, c[k], end[k], ok[k], q[k], &fl[k], f);
+        }
+    }
+    // finish each part on its own
+    for k in 0..K {
+        let mut p = c[k];
+        while p + FAST_GUARD <= end[k] {
+            let r = line_fast::<N>(base, p, &mut fl[0]);
+            p = emit_line::<N>(data, p, end[k], r.0, r.1, &fl[0], f);
+        }
+        if p < end[k] {
+            for_rows::<N>(data, p, end[k], &mut *f);
+        }
+    }
+}
+
 /// Dispatch: AVX2 when the CPU has it, else the portable version.
 #[inline]
 fn rows<const N: usize>(data: &[u8], s: usize, e: usize, mut f: impl FnMut(usize, &[u8], &[(u32, u32); N])) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::env::var_os("NO_AVX2").is_none() {
-            unsafe { for_rows_avx2b::<N>(data, s, e, &mut f) };
+            if std::env::var_os("OLD_TOK").is_some() {
+                unsafe { for_rows_avx2b::<N>(data, s, e, &mut f) };
+            } else {
+                unsafe { for_rows_fast::<N>(data, s, e, &mut f) };
+            }
             return;
         }
     }
@@ -2242,13 +2384,13 @@ mod tests {
         let pieces: [&[u8]; 14] = [b"a", b"bc", b"\"q\"", b"\"\"", b"\"", b",", b",", b",", b"\n", b"x\"y", b"\r", b" ", b"123", b"\"z"];
         for round in 0..3000 {
             let mut buf = Vec::new();
-            let len = 1 + (rnd() % 400) as usize;
+            let len = if round % 20 == 0 { 2_000 + (rnd() % 20_000) as usize } else { 1 + (rnd() % 1500) as usize };
             while buf.len() < len {
-                if rnd() % 5 == 0 {
+                if rnd() % 5 < 3 {
                     // a well-formed 7-field line
                     for i in 0..7 {
                         if i > 0 { buf.push(b','); }
-                        match rnd() % 4 { 0 => buf.extend_from_slice(b"\"v\""), 1 => {}, 2 => buf.extend_from_slice(b"abc"), _ => buf.extend_from_slice(b"\"\"") }
+                        match rnd() % 6 { 0 => buf.extend_from_slice(b"\"v\""), 1 => {}, 2 => buf.extend_from_slice(b"abc"), 3 => { for _ in 0..(rnd() % 40) { buf.push(b'k'); } }, 4 => { buf.push(b'"'); for _ in 0..(rnd() % 34) { buf.push(b'w'); } buf.push(b'"'); }, _ => buf.extend_from_slice(b"\"\"") }
                     }
                     buf.push(b'\n');
                 } else {
@@ -2266,6 +2408,28 @@ mod tests {
                 let mut b2 = vec![];
                 unsafe { for_rows_avx2b::<2>(&buf, 0, cut, &mut |ls, line: &[u8], fl: &[(u32, u32); 2]| b2.push((ls, line.to_vec(), *fl))) };
                 assert_eq!(a2, b2, "round {round} N=2");
+                let mut c = vec![];
+                unsafe { for_rows_fast::<7>(&buf, 0, cut, &mut |ls, line: &[u8], fl: &[(u32, u32); 7]| c.push((ls, line.to_vec(), *fl))) };
+                let mut a_s = a.clone();
+                a_s.sort();
+                c.sort();
+                assert!(a_s == c, "fast round {round}");
+                let mut c2 = vec![];
+                unsafe { for_rows_fast::<2>(&buf, 0, cut, &mut |ls, line: &[u8], fl: &[(u32, u32); 2]| c2.push((ls, line.to_vec(), *fl))) };
+                let mut a2_s = a2.clone();
+                a2_s.sort();
+                c2.sort();
+                assert!(a2_s == c2, "fast round {round} N=2");
+                let off = (rnd() % 5) as usize;
+                if off < cut {
+                    let mut a4 = vec![];
+                    for_rows::<4>(&buf, off, cut, |ls, line, fl| a4.push((ls, line.to_vec(), *fl)));
+                    let mut c4 = vec![];
+                    unsafe { for_rows_fast::<4>(&buf, off, cut, &mut |ls, line: &[u8], fl: &[(u32, u32); 4]| c4.push((ls, line.to_vec(), *fl))) };
+                    a4.sort();
+                    c4.sort();
+                    assert!(a4 == c4, "fast round {round} N=4");
+                }
             }
         }
     }
